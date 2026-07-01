@@ -17,6 +17,9 @@ import sdk, {
     RequestPictureOptions,
     ResponseMediaStreamOptions,
     ResponsePictureOptions,
+    RTCSessionControl,
+    RTCSignalingChannel,
+    RTCSignalingSession,
     ScryptedDeviceBase,
     ScryptedDeviceType,
     ScryptedInterface,
@@ -25,6 +28,7 @@ import sdk, {
     Settings,
     VideoCamera,
 } from '@scrypted/sdk';
+import { LiveKitCameraStream, LiveViewResponse } from './livekit';
 import axios, { AxiosError, AxiosInstance, AxiosRequestConfig } from 'axios';
 import axiosRetry from 'axios-retry';
 import { EventEmitter } from 'events';
@@ -53,6 +57,9 @@ const cameraCacheTime = 15000;
 const rateLimitInitialInterval = 60_000;
 const rateLimitMaxInterval = 2 * 60 * 60 * 1000;
 const mediaHostTtl = 5 * 60 * 1000;
+// Recording providers known to serve the SimpliSafe cloud FLV streaming endpoint.
+// Add the value logged by SS:isUnsupported here once confirmed it works with the FLV path.
+const SUPPORTED_RECORDING_PROVIDERS = new Set<string>(['simplisafe']);
 const socketRetryInterval = 1000;
 const socketHeartbeatInterval = 60_000;
 const socketRetryBackoffCap = 60_000;
@@ -94,6 +101,13 @@ interface SimplisafeCameraSettings {
 
 interface SimplisafeCameraProviders {
     recording?: string;
+    webrtc?: string;
+    live?: string;
+    allSupportedProviders?: {
+        webrtc?: string[];
+        recording?: string[];
+        live?: string[];
+    };
 }
 
 interface SimplisafeCameraSupportedFeatures {
@@ -146,6 +160,16 @@ interface SimplisafeRealtimeMessage {
     type?: string;
     data?: SimplisafeRealtimeEvent;
     [key: string]: unknown;
+}
+
+/**
+ * Newer SimpliSafe cameras stream over LiveKit (WebRTC) instead of the legacy FLV endpoint.
+ * SimpliSafe labels them with providers.webrtc === 'kvs' (typically with live === 'none'), but the
+ * live-view endpoint actually returns LiveKit connection details, not Amazon KVS.
+ */
+function isLiveKitCameraDetails(details: SimplisafeCameraDetails): boolean {
+    const providers = details.supportedFeatures?.providers;
+    return providers?.webrtc === 'kvs' || providers?.recording === 'kvs';
 }
 
 function normalizeIdSegment(value: string): string {
@@ -718,6 +742,36 @@ class SimplisafeApi extends EventEmitter {
         return this.authManager.accessToken;
     }
 
+    /**
+     * Fetch the LiveKit live-view bundle for a newer SimpliSafe camera. Returns
+     * { liveKitDetails: { liveKitURL, userToken }, cameraStatus }. Uses the app-hub host rather
+     * than the standard api.simplisafe.com/v1 base (an absolute url overrides the axios baseURL).
+     */
+    async getLiveView(cameraUuid: string): Promise<LiveViewResponse> {
+        // Ensure the subscription/location id is resolved; getSubscription populates this.subId.
+        await this.getSubscription();
+        const locationId = this.subId;
+        if (!locationId) {
+            throw new Error('Unable to determine SimpliSafe location id for live view.');
+        }
+
+        const raw = await this.request<any>({
+            method: 'GET',
+            url: `https://app-hub.prd.aser.simplisafe.com/v2/cameras/${cameraUuid}/${locationId}/live-view`,
+        });
+
+        // Tolerate a wrapped envelope (e.g. { data: {...} }). The token is short-lived.
+        const body: LiveViewResponse = raw?.liveKitDetails ? raw
+            : raw?.data?.liveKitDetails ? raw.data
+            : raw;
+
+        if (this.debug) {
+            this.log.log(`SS:liveView ${cameraUuid} liveKitURL=${body?.liveKitDetails?.liveKitURL} cameraStatus=${body?.cameraStatus}`);
+        }
+
+        return body;
+    }
+
     async getCameras(forceRefresh = false): Promise<SimplisafeCameraDetails[]> {
         if (!forceRefresh && this.cameraCache && Date.now() - this.cameraCache.timestamp < cameraCacheTime) {
             if (this.debug) {
@@ -889,7 +943,7 @@ class SimplisafeApi extends EventEmitter {
     }
 }
 
-class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Settings, MotionSensor {
+class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Settings, MotionSensor, RTCSignalingChannel {
     private static instanceRegistry = new Map<string, string>();
     private readonly nativeCameraId: string;
     private readonly api: SimplisafeApi;
@@ -899,6 +953,7 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     private readonly statusCallback: (ready: boolean, desiredOnline: boolean) => void;
     private readonly instanceId: string;
     private details?: SimplisafeCameraDetails;
+    private liveKitStream?: LiveKitCameraStream;
     private streamOptions?: ResponseMediaStreamOptions[];
     private pictureOptions?: ResponsePictureOptions[];
     private mediaHost?: string;
@@ -982,6 +1037,9 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
             const cameras = await this.api.getCameras(forceRefresh);
             const details = cameras.find(camera => this.matchesCamera(camera));
             if (details) {
+                if (this.getDebug()) {
+                    this.console.log(`SS:rawCameraDetails ${this.nativeCameraId} ${JSON.stringify(details)}`);
+                }
                 this.updateDetails(details);
                 return details;
             }
@@ -1090,7 +1148,8 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
         this.logInstanceUsage('getVideoStreamOptions');
-        console.log('SS:getVideoStreamOptions', this.nativeCameraId);
+        if (this.getDebug())
+            this.console.log('SS:getVideoStreamOptions', this.nativeCameraId);
         try {
             const details = await this.ensureDetails();
 
@@ -1107,9 +1166,14 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
 
     async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
         this.logInstanceUsage('getVideoStream');
-        console.log('SS:getVideoStream', this.nativeCameraId, options);
+        if (this.getDebug())
+            this.console.log('SS:getVideoStream', this.nativeCameraId, options);
         try {
             const details = await this.ensureDetails();
+
+            if (this.isLiveKitCamera(details)) {
+                throw new Error(`${this.getDisplayName()} streams over WebRTC; use the RTCSignalingChannel path, not getVideoStream.`);
+            }
 
             if (this.isUnsupported(details)) {
                 throw new Error(`${this.getDisplayName()} does not support SimpliSafe cloud streaming.`);
@@ -1151,9 +1215,16 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
 
     async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
         this.logInstanceUsage('takePicture');
-        try {
-            const details = await this.ensureDetails();
+        const details = await this.ensureDetails();
 
+        // LiveKit cameras have no snapshot endpoint, and the SFU won't reliably hand out a keyframe
+        // on demand for an idle camera. Reject quietly so Scrypted's Snapshot plugin derives the
+        // still from the rebroadcast prebuffer (and caches it) instead.
+        if (this.isLiveKitCamera(details)) {
+            throw new Error(`${this.getDisplayName()} does not support direct snapshot capture; derived from the WebRTC stream.`);
+        }
+
+        try {
             if (this.isUnsupported(details)) {
                 throw new Error(`${this.getDisplayName()} does not support snapshots.`);
             }
@@ -1294,9 +1365,60 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
         return `Camera ${this.nativeCameraId}`;
     }
 
+    /**
+     * Newer SimpliSafe cameras stream over LiveKit (WebRTC), reported as providers.webrtc === 'kvs'
+     * (and typically live === 'none'), instead of the legacy FLV endpoint.
+     */
+    isLiveKitCamera(details: SimplisafeCameraDetails): boolean {
+        return isLiveKitCameraDetails(details);
+    }
+
     private isUnsupported(details: SimplisafeCameraDetails): boolean {
-        return details.supportedFeatures?.providers?.recording !== undefined
-            && details.supportedFeatures.providers.recording !== 'simplisafe';
+        // LiveKit cameras are supported via the WebRTC/RTCSignalingChannel path, not FLV.
+        if (this.isLiveKitCamera(details)) {
+            return false;
+        }
+        const provider = details.supportedFeatures?.providers?.recording;
+        const unsupported = provider !== undefined && !SUPPORTED_RECORDING_PROVIDERS.has(provider);
+        if (unsupported && this.getDebug()) {
+            this.console.log(
+                `SS:isUnsupported ${this.getDisplayName()} recordingProvider=${JSON.stringify(provider)} ` +
+                `supportedFeatures=${JSON.stringify(details.supportedFeatures)}`);
+        }
+        return unsupported;
+    }
+
+    async startRTCSignalingSession(session: RTCSignalingSession): Promise<RTCSessionControl | undefined> {
+        this.logInstanceUsage('startRTCSignalingSession');
+        const details = await this.ensureDetails();
+        if (!this.isLiveKitCamera(details)) {
+            throw new Error(`${this.getDisplayName()} does not support WebRTC streaming.`);
+        }
+
+        try {
+            return await this.getLiveKitStream(details.uuid).startSession(session);
+        } catch (err) {
+            this.console.error(`Failed to start SimpliSafe WebRTC stream for ${this.nativeCameraId}.`, err);
+            throw err;
+        }
+    }
+
+    /** One shared LiveKit connection per camera, fanned out to all Scrypted consumers. */
+    private getLiveKitStream(cameraUuid: string): LiveKitCameraStream {
+        if (!this.liveKitStream) {
+            this.liveKitStream = new LiveKitCameraStream(async () => {
+                const liveView = await this.api.getLiveView(cameraUuid);
+                const liveKit = liveView.liveKitDetails;
+                if (!liveKit?.liveKitURL || !liveKit?.userToken) {
+                    throw new Error(`${this.getDisplayName()} live-view response did not include LiveKit details.`);
+                }
+                if (this.getDebug()) {
+                    this.console.log(`SS:liveView ${this.nativeCameraId} liveKitURL=${liveKit.liveKitURL} cameraStatus=${liveView.cameraStatus}`);
+                }
+                return liveKit;
+            }, this.console, this.getDebug);
+        }
+        return this.liveKitStream;
     }
 
     async getSettings(): Promise<Setting[]> {
@@ -1523,7 +1645,10 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
             return;
         }
 
-        const includeVideoCamera = this.upgradedNativeIds.has(nativeId);
+        const liveKit = isLiveKitCameraDetails(details);
+        // LiveKit cameras stream over WebRTC (RTCSignalingChannel); the FLV VideoCamera path is
+        // dead for them. Legacy cameras keep VideoCamera, added after the readiness probe.
+        const includeVideoCamera = !liveKit && this.upgradedNativeIds.has(nativeId);
         const interfaces: (ScryptedInterface | string)[] = [
             ScryptedInterface.Camera,
             ScryptedInterface.Settings,
@@ -1534,6 +1659,10 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
 
         if (includeVideoCamera) {
             interfaces.push(ScryptedInterface.VideoCamera);
+        }
+
+        if (liveKit) {
+            interfaces.push(ScryptedInterface.RTCSignalingChannel);
         }
 
         const name = details.cameraSettings?.cameraName
@@ -1857,7 +1986,11 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                 this.cachedDescriptors.set(normalized, stored);
                 const key = this.computeDescriptorKey(stored);
                 this.lastPublished.set(normalized, key);
-                if (stored.interfaces.includes(ScryptedInterface.VideoCamera) || stored.interfaces.includes('VideoCamera')) {
+                const streamingReady = stored.interfaces.includes(ScryptedInterface.VideoCamera)
+                    || stored.interfaces.includes('VideoCamera')
+                    || stored.interfaces.includes(ScryptedInterface.RTCSignalingChannel)
+                    || stored.interfaces.includes('RTCSignalingChannel');
+                if (streamingReady) {
                     this.upgradedNativeIds.add(normalized);
                     if (!this.cameraReady.has(normalized)) {
                         this.cameraReady.set(normalized, true);
