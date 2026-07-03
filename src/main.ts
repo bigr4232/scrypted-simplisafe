@@ -11,6 +11,7 @@ import sdk, {
     DeviceState,
     DeviceProvider,
     FFmpegInput,
+    Intercom,
     MediaObject,
     MotionSensor,
     RequestMediaStreamOptions,
@@ -23,16 +24,20 @@ import sdk, {
     ScryptedDeviceBase,
     ScryptedDeviceType,
     ScryptedInterface,
+    ScryptedMimeTypes,
     Setting,
     SettingValue,
     Settings,
     VideoCamera,
 } from '@scrypted/sdk';
 import { LiveKitCameraStream, LiveViewResponse } from './livekit';
+import { RtpPacket } from '@koush/werift';
 import axios, { AxiosError, AxiosInstance, AxiosRequestConfig } from 'axios';
 import axiosRetry from 'axios-retry';
+import { ChildProcess, spawn } from 'child_process';
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
+import dgram from 'dgram';
 import dns from 'dns';
 const { lookup } = dns.promises;
 import jpegExtract from 'jpeg-extract';
@@ -943,7 +948,7 @@ class SimplisafeApi extends EventEmitter {
     }
 }
 
-class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Settings, MotionSensor, RTCSignalingChannel {
+class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Settings, MotionSensor, RTCSignalingChannel, Intercom {
     private static instanceRegistry = new Map<string, string>();
     private readonly nativeCameraId: string;
     private readonly api: SimplisafeApi;
@@ -965,6 +970,9 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     private readonly motionHoldDurationMs = 5_000;
     motionDetected?: boolean;
     motionDetectedTimestamp?: number;
+    private intercomProcess?: ChildProcess;
+    private intercomSocket?: dgram.Socket;
+    private intercomCleanup?: () => void;
 
     constructor(
         nativeId: string,
@@ -1421,6 +1429,92 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
         return this.liveKitStream;
     }
 
+    /**
+     * Two-way audio (talk-back). Scrypted/HomeKit hands us the return audio as an FFmpegInput; we
+     * transcode it to Opus RTP, feed it to a werift track, and publish that track upstream to
+     * LiveKit over the shared participant connection.
+     */
+    async startIntercom(media: MediaObject): Promise<void> {
+        this.logInstanceUsage('startIntercom');
+        const details = await this.ensureDetails();
+        if (!this.isLiveKitCamera(details)) {
+            throw new Error(`${this.getDisplayName()} does not support two-way audio.`);
+        }
+
+        // Tear down any prior intercom session before starting a new one.
+        await this.stopIntercom();
+
+        const ffmpegInput = await mediaManager.convertMediaObjectToJSON<FFmpegInput>(media, ScryptedMimeTypes.FFmpegInput);
+        const ffmpegPath = await mediaManager.getFFmpegPath();
+
+        try {
+            // Acquire the shared LiveKit talk-back sink (published once, reused across sessions).
+            const sink = await this.getLiveKitStream(details.uuid).acquireMicSink();
+            this.intercomCleanup = sink.release;
+
+            // Bind a UDP socket so we can tell ffmpeg which port to emit Opus RTP to.
+            const socket = dgram.createSocket('udp4');
+            this.intercomSocket = socket;
+            // An unhandled dgram 'error' would surface as an uncaughtException and kill the plugin.
+            socket.on('error', err => this.console.error('SimpliSafe intercom socket error.', err));
+            const port = await new Promise<number>((resolve, reject) => {
+                socket.once('error', reject);
+                socket.bind(0, '127.0.0.1', () => resolve(socket.address().port));
+            });
+
+            socket.on('message', buf => {
+                try {
+                    const pkt = RtpPacket.deSerialize(buf);
+                    pkt.header.payloadType = sink.track.codec?.payloadType ?? 111;
+                    sink.track.writeRtp(pkt);
+                }
+                catch {
+                    /* ignore malformed packet */
+                }
+            });
+
+            const args = [
+                ...ffmpegInput.inputArguments!,
+                '-vn',
+                '-acodec', 'libopus',
+                '-ac', '2',
+                '-ar', '48000',
+                '-application', 'lowdelay',
+                '-f', 'rtp',
+                '-payload_type', '111',
+                `rtp://127.0.0.1:${port}`,
+            ];
+            if (this.getDebug())
+                this.console.log('SS:startIntercom ffmpeg', ffmpegPath, args.join(' '));
+
+            const cp = spawn(ffmpegPath, args, {
+                env: ffmpegInput.env ? { ...process.env, ...ffmpegInput.env } : process.env,
+            });
+            this.intercomProcess = cp;
+            cp.on('error', err => this.console.error('SimpliSafe intercom ffmpeg error.', err));
+            cp.stderr?.on('data', data => {
+                if (this.getDebug())
+                    this.console.log('SS:intercom ffmpeg', data.toString());
+            });
+            cp.on('exit', () => { this.stopIntercom().catch(() => { /* ignore */ }); });
+        }
+        catch (err) {
+            this.console.error(`Failed to start SimpliSafe talk-back for ${this.nativeCameraId}.`, err);
+            await this.stopIntercom();
+            throw err;
+        }
+    }
+
+    async stopIntercom(): Promise<void> {
+        this.logInstanceUsage('stopIntercom');
+        try { this.intercomCleanup?.(); } catch { /* ignore */ }
+        this.intercomCleanup = undefined;
+        try { this.intercomProcess?.kill('SIGKILL'); } catch { /* ignore */ }
+        this.intercomProcess = undefined;
+        try { this.intercomSocket?.close(); } catch { /* ignore */ }
+        this.intercomSocket = undefined;
+    }
+
     async getSettings(): Promise<Setting[]> {
         this.logInstanceUsage('getSettings');
         return [];
@@ -1663,6 +1757,8 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
 
         if (liveKit) {
             interfaces.push(ScryptedInterface.RTCSignalingChannel);
+            // LiveKit cameras support two-way audio by publishing a mic track upstream.
+            interfaces.push(ScryptedInterface.Intercom);
         }
 
         const name = details.cameraSettings?.cameraName

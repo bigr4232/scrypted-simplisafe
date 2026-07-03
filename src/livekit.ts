@@ -19,6 +19,7 @@
 import WebSocket from 'ws';
 import {
     MediaStreamTrack,
+    RtpPacket,
     RTCIceCandidate,
     RTCPeerConnection,
     RTCRtpCodecParameters,
@@ -50,11 +51,34 @@ const SUBSCRIBE_AUDIO_CODECS = [
         payloadType: 111,
     }),
 ];
+// Talk-back (microphone) is published with RED (RFC 2198 redundant Opus) as the primary codec,
+// matching exactly what the SimpliSafe app publishes (track name "microphone", mimeType audio/red).
+// The camera only plays audio published this way. werift auto-fills the red codec's parameters to
+// `${payloadType+1}/${payloadType+1}`, so opus must sit at the red payloadType + 1 (110 -> 111), and
+// werift's sender then RED-wraps the forwarded Opus payloads automatically.
+const PUBLISH_AUDIO_CODECS = [
+    new RTCRtpCodecParameters({
+        mimeType: 'audio/red',
+        clockRate: 48000,
+        channels: 2,
+        payloadType: 110,
+    }),
+    new RTCRtpCodecParameters({
+        mimeType: 'audio/opus',
+        clockRate: 48000,
+        channels: 2,
+        payloadType: 111,
+    }),
+];
 import {
+    AddTrackRequest,
+    MuteTrackRequest,
     SessionDescription,
     SignalRequest,
     SignalResponse,
     SignalTarget,
+    TrackSource,
+    TrackType,
     TrickleRequest,
 } from '@livekit/protocol';
 import type {
@@ -109,6 +133,24 @@ interface LiveKitViewer {
     videoTrack?: MediaStreamTrack;
     audioTrack?: MediaStreamTrack;
     close: () => void;
+    /**
+     * Lazily publish a single shared talk-back (microphone) track to LiveKit over this same
+     * participant connection and return it. Callers write RTP into the returned track; it is
+     * published only once and reused across all consumer sessions.
+     */
+    ensureMicTrack: () => Promise<MediaStreamTrack>;
+    /**
+     * Request exclusive use of the shared talk-back track for the calling session (identified by a
+     * stable token). Returns true if this session owns the mic and may write RTP; false if another
+     * session is currently talking. Unmutes on claim and re-mutes after the talker goes idle,
+     * mirroring how the SimpliSafe app toggles mute per talk so the camera re-triggers playback.
+     */
+    claimMic: (token: object) => boolean;
+    /**
+     * Write a talk-back packet into the shared mic track, rewriting its sequence/timestamp to our own
+     * monotonic counters so the stream stays continuous across consumer-session (source) switches.
+     */
+    writeMic: (rtp: RtpPacket) => void;
 }
 
 /**
@@ -137,11 +179,65 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
     let remoteDescriptionSet = false;
     const pendingCandidates: RTCIceCandidate[] = [];
 
+    // Publisher (outbound) peer connection state, created lazily when the first mic track is
+    // published. LiveKit uses a separate publisher PC on the SAME signaling websocket/participant.
+    let joinIceServers: any[] = [];
+    let publisherPc: RTCPeerConnection | undefined;
+    let publisherRemoteDescriptionSet = false;
+    let publisherMicSender: any;
+    const pendingPublisherCandidates: RTCIceCandidate[] = [];
+
+    // Mic mute state. The SimpliSafe app toggles its published microphone track muted<->unmuted per
+    // talk; the camera keys its speaker off the unmute (mute->unmute) transition. We keep one
+    // persistent published track and mute it after talk-back audio stops so the next talk unmutes
+    // afresh — otherwise a permanently-unmuted track only triggers the camera the first time.
+    //
+    // There is ONE shared published mic track but potentially several consumer sessions (multiple
+    // HomeKit devices). Only one may feed the track at a time: interleaving RTP from two sessions
+    // (different SSRCs/timestamps) into the single sender corrupts the RED/sequence state and breaks
+    // talk-back for everyone until the connection is torn down. `claimMic(token)` grants exclusive
+    // ownership to the first talker; others are refused until the owner goes idle (inactivity).
+    let micSid: string | undefined;
+    let micMuted = false;
+    let micOwner: object | undefined;
+    let micMuteTimer: NodeJS.Timeout | undefined;
+    const sendMute = (muted: boolean) => {
+        if (!micSid)
+            return;
+        send({ case: 'mute', value: new MuteTrackRequest({ sid: micSid, muted }) });
+        dlog('SS:LiveKit mic', muted ? 'muted (talk stop)' : 'unmuted (talk start)', micSid);
+    };
+    // Called on each inbound talk-back packet with the calling session's token. Returns true only if
+    // this session owns the mic (and may write RTP). Unmutes on claim and arms an inactivity timer
+    // that releases ownership + re-mutes shortly after audio stops.
+    const claimMic = (token: object): boolean => {
+        if (micOwner && micOwner !== token)
+            return false;
+        if (!micOwner) {
+            micOwner = token;
+            if (micMuted) {
+                micMuted = false;
+                sendMute(false);
+            }
+        }
+        if (micMuteTimer)
+            clearTimeout(micMuteTimer);
+        micMuteTimer = setTimeout(() => {
+            micOwner = undefined;
+            micMuted = true;
+            sendMute(true);
+        }, 800);
+        return true;
+    };
+
     const cleanup = () => {
         if (pingTimer)
             clearInterval(pingTimer);
+        if (micMuteTimer)
+            clearTimeout(micMuteTimer);
         try { ws.close(); } catch { /* ignore */ }
         try { pc?.close(); } catch { /* ignore */ }
+        try { publisherPc?.close(); } catch { /* ignore */ }
     };
 
     const send = (message: SignalRequest['message']) => {
@@ -199,6 +295,7 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
                     const join = msg.value;
                     dlog('SS:LiveKit join subscriberPrimary=', join.subscriberPrimary,
                         'iceServers=', join.iceServers?.length, 'pingInterval=', join.pingInterval);
+                    joinIceServers = join.iceServers as any[];
                     setupPeerConnection(join.iceServers as any[]);
                     const intervalMs = (join.pingInterval || 30) * 1000;
                     pingTimer = setInterval(() => send({ case: 'ping', value: BigInt(Date.now()) }), intervalMs);
@@ -227,9 +324,30 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
                     });
                     break;
                 }
-                case 'trickle': {
-                    if (!pc)
+                case 'answer': {
+                    // The server answers the offer we sent on the PUBLISHER peer connection when
+                    // publishing the mic track. (The subscriber flow is the reverse: server offers.)
+                    if (!publisherPc) {
+                        console.warn('SS:LiveKit received answer with no publisher PC; ignoring.');
                         break;
+                    }
+                    const answer = msg.value;
+                    await publisherPc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+                    publisherRemoteDescriptionSet = true;
+                    for (const candidate of pendingPublisherCandidates.splice(0))
+                        await publisherPc.addIceCandidate(candidate).catch(() => { /* ignore */ });
+                    // werift derives the RED block payload type from the negotiated red fmtp, but
+                    // LiveKit's answer leaves it empty -> redRedundantPayloadType=0 (falsy) -> the
+                    // sender skips RED wrapping and ships raw Opus mislabelled as RED, which the camera
+                    // can't decode. Force it to the Opus PT so werift actually builds RED packets.
+                    if (publisherMicSender && !publisherMicSender.redRedundantPayloadType) {
+                        publisherMicSender.redRedundantPayloadType = PUBLISH_AUDIO_CODECS[1].payloadType;
+                        dlog('SS:LiveKit forced publisher RED redundant PT=', publisherMicSender.redRedundantPayloadType);
+                    }
+                    dlog('SS:LiveKit publisher answer applied.');
+                    break;
+                }
+                case 'trickle': {
                     const init = JSON.parse(msg.value.candidateInit);
                     if (!init?.candidate)
                         break;
@@ -238,12 +356,29 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
                         sdpMid: init.sdpMid,
                         sdpMLineIndex: init.sdpMLineIndex,
                     });
+                    if (msg.value.target === SignalTarget.PUBLISHER) {
+                        if (!publisherPc)
+                            break;
+                        if (publisherRemoteDescriptionSet)
+                            await publisherPc.addIceCandidate(candidate).catch(() => { /* ignore */ });
+                        else
+                            pendingPublisherCandidates.push(candidate);
+                        break;
+                    }
+                    if (!pc)
+                        break;
                     if (remoteDescriptionSet)
                         await pc.addIceCandidate(candidate).catch(() => { /* ignore */ });
                     else
                         pendingCandidates.push(candidate);
                     break;
                 }
+                case 'trackPublished':
+                    dlog('SS:LiveKit track published:', msg.value.cid, msg.value.track?.sid, msg.value.track?.type);
+                    // Remember the mic track sid so we can mute/unmute it per talk session.
+                    if (msg.value.track?.type === TrackType.AUDIO && msg.value.track?.sid)
+                        micSid = msg.value.track.sid;
+                    break;
                 case 'leave':
                     dlog('SS:LiveKit server requested leave.');
                     cleanup();
@@ -300,7 +435,92 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
         }, 100);
     });
 
-    return { pc: pc!, videoTrack, audioTrack, close: cleanup };
+    // A single, persistent talk-back (microphone) track is published to LiveKit at most once per
+    // connection and shared by every consumer session. Publishing per-session would add a new
+    // transceiver and renegotiate the shared publisher each time, which corrupts it after the first
+    // session (talk-back "works once then stops").
+    //
+    // Every consumer session's talk-back RTP is written into this one shared sender. Each HomeKit
+    // talk session has its own SSRC/sequence/timestamp bases, and werift's sender passes the input
+    // sequence/timestamp through (only offsetting the SSRC), so switching sources would make the
+    // sequence jump backwards and the camera would discard the packets as stale. `writeMic` rewrites
+    // every packet's sequence/timestamp to our own monotonic counters so the stream stays continuous
+    // across source switches, regardless of which session is talking.
+    let micPublish: Promise<MediaStreamTrack> | undefined;
+    let micTrackRef: MediaStreamTrack | undefined;
+    let micSeq = Math.floor(Math.random() * 0xffff);
+    let micTs = Math.floor(Math.random() * 0xffffffff);
+    const writeMic = (rtp: RtpPacket): void => {
+        if (!micTrackRef)
+            return;
+        rtp.header.sequenceNumber = micSeq;
+        micSeq = (micSeq + 1) & 0xffff;
+        rtp.header.timestamp = micTs;
+        micTs = (micTs + 960) >>> 0; // 20ms @ 48kHz Opus
+        micTrackRef.writeRtp(rtp);
+    };
+    const ensureMicTrack = (): Promise<MediaStreamTrack> => {
+        if (micPublish)
+            return micPublish;
+        micPublish = (async () => {
+            if (!publisherPc) {
+                publisherPc = new RTCPeerConnection({
+                    iceServers: normalizeIceServers(joinIceServers),
+                    bundlePolicy: 'max-bundle',
+                    codecs: { audio: PUBLISH_AUDIO_CODECS },
+                });
+                publisherPc.onIceCandidate.subscribe(candidate => {
+                    if (!candidate?.candidate)
+                        return;
+                    send({
+                        case: 'trickle',
+                        value: new TrickleRequest({
+                            candidateInit: JSON.stringify(candidate.toJSON()),
+                            target: SignalTarget.PUBLISHER,
+                        }),
+                    });
+                });
+                publisherPc.connectionStateChange.subscribe(state =>
+                    dlog('SS:LiveKit publisher connection state:', state));
+            }
+
+            const track = new MediaStreamTrack({ kind: 'audio', id: `mic-${Date.now()}` });
+            micTrackRef = track;
+            const micTransceiver = publisherPc.addTransceiver(track, { direction: 'sendonly' });
+            // The 'answer' handler force-enables RED wrapping on this sender once negotiation settles
+            // (werift otherwise leaves redRedundantPayloadType=0 and sends raw Opus mislabelled as RED).
+            publisherMicSender = micTransceiver.sender;
+
+            // Announce the track to LiveKit, then negotiate: we (the client) offer on the PUBLISHER
+            // target and the server answers (handled in the 'answer' case above).
+            const cid = track.id!;
+            send({
+                case: 'addTrack',
+                value: new AddTrackRequest({
+                    cid,
+                    // Match the SimpliSafe app's talk-back track exactly (name "microphone"); the
+                    // camera keys its speaker playback off this convention.
+                    name: 'microphone',
+                    type: TrackType.AUDIO,
+                    source: TrackSource.MICROPHONE,
+                }),
+            });
+
+            const offer = await publisherPc.createOffer();
+            await publisherPc.setLocalDescription(offer);
+            send({
+                case: 'offer',
+                value: new SessionDescription({ type: 'offer', sdp: offer.sdp }),
+            });
+            dlog('SS:LiveKit publishing mic track cid=', cid);
+            return track;
+        })();
+        // Allow a retry on failure (e.g. transient publisher negotiation error).
+        micPublish.catch(() => { micPublish = undefined; });
+        return micPublish;
+    };
+
+    return { pc: pc!, videoTrack, audioTrack, close: cleanup, ensureMicTrack, claimMic, writeMic };
 }
 
 /**
@@ -474,6 +694,32 @@ export class LiveKitCameraStream {
         }
     }
 
+    /**
+     * Acquire the shared talk-back sink for the device-level Intercom path (used by non-WebRTC
+     * consumers). Ensures a connection exists (so talk-back works even if nothing is actively
+     * viewing) and holds a refcount for the duration. Returns the shared mic track to write RTP
+     * into, plus a release function that drops the refcount.
+     */
+    async acquireMicSink(): Promise<{ track: MediaStreamTrack; release: () => void }> {
+        const viewer = await this.ensureViewer();
+        this.refcount++;
+        let released = false;
+        const release = () => {
+            if (released)
+                return;
+            released = true;
+            this.release();
+        };
+        try {
+            const track = await viewer.ensureMicTrack();
+            return { track, release };
+        }
+        catch (err) {
+            release();
+            throw err;
+        }
+    }
+
     private release(): void {
         this.refcount = Math.max(0, this.refcount - 1);
         if (this.refcount === 0) {
@@ -506,25 +752,60 @@ async function bridgeToScryptedSession(
         codecs,
     });
 
-    // Outbound tracks fed by forwarding RTP from the LiveKit tracks.
+    // Outbound video, fed by forwarding RTP from the LiveKit track.
     const videoOut = new MediaStreamTrack({ kind: 'video' });
     consumerPc.addTransceiver(videoOut, { direction: 'sendonly' });
     viewer.videoTrack?.onReceiveRtp.subscribe(rtp => videoOut.writeRtp(rtp));
 
-    let audioOut: MediaStreamTrack | undefined;
+    // Audio is bidirectional. We send the camera's audio to the consumer AND accept talk-back (the
+    // viewer's microphone) on the same transceiver: Scrypted's WebRTC plugin implements HomeKit
+    // two-way audio by pushing the mic audio back over THIS peer connection (it requests sendrecv),
+    // not by calling the device's Intercom. Any inbound audio is forwarded up to the LiveKit
+    // publisher so it reaches the camera.
     if (viewer.audioTrack) {
-        audioOut = new MediaStreamTrack({ kind: 'audio' });
-        consumerPc.addTransceiver(audioOut, { direction: 'sendonly' });
-        viewer.audioTrack.onReceiveRtp.subscribe(rtp => audioOut!.writeRtp(rtp));
+        const audioOut = new MediaStreamTrack({ kind: 'audio' });
+        consumerPc.addTransceiver(audioOut, { direction: 'sendrecv' });
+        viewer.audioTrack.onReceiveRtp.subscribe(rtp => audioOut.writeRtp(rtp));
     }
+    else {
+        consumerPc.addTransceiver('audio', { direction: 'recvonly' });
+    }
+
+    // Forward inbound talk-back audio into the shared LiveKit mic track. The track is published once
+    // (lazily, on first audio) and reused across every session, so re-publishing/renegotiation never
+    // happens — that was corrupting the shared publisher after the first talk-back. Only the session
+    // that currently owns the mic (claimMic) writes RTP: mixing two sessions into the one sender
+    // corrupts it and breaks talk-back for everyone.
+    let micStarted = false;
+    let micStarting = false;
+    const micToken = {};
+    consumerPc.onTrack.subscribe(track => {
+        if (track.kind !== 'audio')
+            return;
+        track.onReceiveRtp.subscribe(rtp => {
+            // Take (or keep) exclusive ownership of the shared mic; bail if another session is talking.
+            if (!viewer.claimMic(micToken))
+                return;
+            if (!micStarting) {
+                micStarting = true;
+                viewer.ensureMicTrack()
+                    .then(() => { micStarted = true; })
+                    .catch(err => console.warn('SS:LiveKit talk-back publish failed.', err));
+            }
+            if (!micStarted)
+                return;
+            // Forward into the shared mic track with monotonic sequence/timestamp rewriting.
+            viewer.writeMic(rtp);
+        });
+    });
 
     const weriftSession = new WeriftSignalingSession(console, consumerPc);
     const consumerSetup: Partial<RTCAVSignalingSetup> = {
-        audio: { direction: 'sendonly' },
+        audio: { direction: 'sendrecv' },
         video: { direction: 'sendonly' },
     };
     const sessionSetup: Partial<RTCAVSignalingSetup> = {
-        audio: { direction: 'recvonly' },
+        audio: { direction: 'sendrecv' },
         video: { direction: 'recvonly' },
     };
 
@@ -539,7 +820,8 @@ async function bridgeToScryptedSession(
     const control = new SimplisafeRTCSessionControl(() => {
         try { consumerPc.close(); } catch { /* ignore */ }
         // Release this consumer's hold on the shared LiveKit connection; the streamer tears the
-        // upstream down only when the last consumer leaves.
+        // upstream down only when the last consumer leaves. The shared mic track is not torn down
+        // per session — it lives with the viewer and is closed when the last consumer leaves.
         onEnd();
     });
 
