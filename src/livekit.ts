@@ -128,11 +128,118 @@ function normalizeIceServers(iceServers: any[] | undefined): any[] {
     return ret;
 }
 
+const H264_START_CODE = Buffer.from([0x00, 0x00, 0x00, 0x01]);
+
+/**
+ * Reassembles the camera's H264 RTP into Annex-B access units and retains the most recent keyframe
+ * (SPS + PPS + IDR). This lets the plugin produce a still from the already-flowing WebRTC video
+ * without cold-starting a fresh stream — the slow, timeout-prone path that otherwise makes HomeKit
+ * show "Snapshot Failed". werift's H264RtpPayload does not reassemble FU-A fragments (how keyframe
+ * slices almost always arrive), so RFC 6184 depacketization is done here.
+ */
+class H264KeyframeCapturer {
+    private sps?: Buffer;
+    private pps?: Buffer;
+    private auNals: Buffer[] = [];
+    private auHasIdr = false;
+    private auHasSps = false;
+    private auHasPps = false;
+    private auTimestamp?: number;
+    private fuBuffer?: Buffer;
+    private latest?: Buffer;
+
+    get keyframe(): Buffer | undefined {
+        return this.latest;
+    }
+
+    onRtp(rtp: RtpPacket): void {
+        const buf = rtp.payload;
+        if (!buf || buf.length < 1)
+            return;
+
+        // A change in RTP timestamp marks a new access unit; flush the previous one. (The marker bit
+        // handled below is the primary boundary; this is a fallback when markers are unreliable.)
+        const timestamp = rtp.header.timestamp;
+        if (this.auTimestamp !== undefined && timestamp !== this.auTimestamp)
+            this.finishAccessUnit();
+        this.auTimestamp = timestamp;
+
+        const nalType = buf[0] & 0x1f;
+        if (nalType >= 1 && nalType <= 23) {
+            // Single NAL unit packet.
+            this.pushNal(buf);
+        }
+        else if (nalType === 24) {
+            // STAP-A: one packet aggregating several NAL units (commonly SPS + PPS).
+            let offset = 1;
+            while (offset + 2 <= buf.length) {
+                const size = buf.readUInt16BE(offset);
+                offset += 2;
+                if (size === 0 || offset + size > buf.length)
+                    break;
+                this.pushNal(buf.subarray(offset, offset + size));
+                offset += size;
+            }
+        }
+        else if (nalType === 28) {
+            // FU-A: a single NAL unit fragmented across packets.
+            if (buf.length < 2)
+                return;
+            const fuHeader = buf[1];
+            const start = (fuHeader & 0x80) !== 0;
+            const end = (fuHeader & 0x40) !== 0;
+            const fragment = buf.subarray(2);
+            if (start) {
+                const nalHeader = (buf[0] & 0xe0) | (fuHeader & 0x1f);
+                this.fuBuffer = Buffer.concat([Buffer.from([nalHeader]), fragment]);
+            }
+            else if (this.fuBuffer) {
+                this.fuBuffer = Buffer.concat([this.fuBuffer, fragment]);
+            }
+            if (end && this.fuBuffer) {
+                this.pushNal(this.fuBuffer);
+                this.fuBuffer = undefined;
+            }
+        }
+        // STAP-B / FU-B / MTAP are not used by these cameras and are ignored.
+
+        if (rtp.header.marker)
+            this.finishAccessUnit();
+    }
+
+    private pushNal(nal: Buffer): void {
+        const type = nal[0] & 0x1f;
+        if (type === 7) { this.sps = nal; this.auHasSps = true; }
+        else if (type === 8) { this.pps = nal; this.auHasPps = true; }
+        else if (type === 5) this.auHasIdr = true;
+        this.auNals.push(nal);
+    }
+
+    private finishAccessUnit(): void {
+        if (this.auHasIdr && this.auNals.length) {
+            const parts: Buffer[] = [];
+            // Ensure the still is decodable even if the camera sent parameter sets in an earlier AU.
+            if (this.sps && !this.auHasSps) parts.push(H264_START_CODE, this.sps);
+            if (this.pps && !this.auHasPps) parts.push(H264_START_CODE, this.pps);
+            for (const nal of this.auNals) parts.push(H264_START_CODE, nal);
+            this.latest = Buffer.concat(parts);
+        }
+        this.auNals = [];
+        this.auHasIdr = false;
+        this.auHasSps = false;
+        this.auHasPps = false;
+        this.fuBuffer = undefined;
+        this.auTimestamp = undefined;
+    }
+}
+
 interface LiveKitViewer {
     pc: RTCPeerConnection;
     videoTrack?: MediaStreamTrack;
     audioTrack?: MediaStreamTrack;
     close: () => void;
+    /** The most recent decode-ready H264 keyframe (Annex-B SPS+PPS+IDR), if any has been seen. */
+    getKeyframe: () => Buffer | undefined;
     /**
      * Lazily publish a single shared talk-back (microphone) track to LiveKit over this same
      * participant connection and return it. Callers write RTP into the returned track; it is
@@ -175,6 +282,7 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
     let pc: RTCPeerConnection | undefined;
     let videoTrack: MediaStreamTrack | undefined;
     let audioTrack: MediaStreamTrack | undefined;
+    const keyframeCapturer = new H264KeyframeCapturer();
     let pingTimer: NodeJS.Timeout | undefined;
     let remoteDescriptionSet = false;
     const pendingCandidates: RTCIceCandidate[] = [];
@@ -269,8 +377,14 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
         });
 
         pc.onTrack.subscribe(track => {
-            if (track.kind === 'video')
+            if (track.kind === 'video') {
                 videoTrack = track;
+                // Passively watch the video RTP to retain the latest keyframe for on-demand snapshots.
+                track.onReceiveRtp.subscribe(rtp => {
+                    try { keyframeCapturer.onRtp(rtp); }
+                    catch { /* ignore malformed packet */ }
+                });
+            }
             else if (track.kind === 'audio')
                 audioTrack = track;
         });
@@ -520,7 +634,7 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
         return micPublish;
     };
 
-    return { pc: pc!, videoTrack, audioTrack, close: cleanup, ensureMicTrack, claimMic, writeMic };
+    return { pc: pc!, videoTrack, audioTrack, close: cleanup, getKeyframe: () => keyframeCapturer.keyframe, ensureMicTrack, claimMic, writeMic };
 }
 
 /**
@@ -655,6 +769,14 @@ export class LiveKitCameraStream {
     private viewerHealthy(viewer: LiveKitViewer): boolean {
         const state = viewer.pc.connectionState;
         return state !== 'failed' && state !== 'closed';
+    }
+
+    /**
+     * The latest H264 keyframe (Annex-B) from the active viewer, if one is currently connected.
+     * Returns undefined when the camera is idle (no live video is flowing).
+     */
+    getKeyframe(): Buffer | undefined {
+        return this.viewer?.getKeyframe();
     }
 
     private async ensureViewer(): Promise<LiveKitViewer> {
