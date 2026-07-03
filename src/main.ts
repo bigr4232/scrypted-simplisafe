@@ -973,6 +973,9 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     private intercomProcess?: ChildProcess;
     private intercomSocket?: dgram.Socket;
     private intercomCleanup?: () => void;
+    private snapshotCache?: Buffer;
+    private snapshotCacheTime = 0;
+    private snapshotRefresh?: Promise<Buffer | undefined>;
 
     constructor(
         nativeId: string,
@@ -1225,10 +1228,16 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
         this.logInstanceUsage('takePicture');
         const details = await this.ensureDetails();
 
-        // LiveKit cameras have no snapshot endpoint, and the SFU won't reliably hand out a keyframe
-        // on demand for an idle camera. Reject quietly so Scrypted's Snapshot plugin derives the
-        // still from the rebroadcast prebuffer (and caches it) instead.
+        // LiveKit cameras have no snapshot endpoint. Instead of cold-starting the WebRTC->RTSP path
+        // on every request (slow, and prone to timing out as "Snapshot Failed" in HomeKit), serve a
+        // JPEG decoded from the live stream's latest keyframe, cached so idle cameras answer instantly.
         if (this.isLiveKitCamera(details)) {
+            const jpeg = await this.getLiveKitSnapshot();
+            if (jpeg?.length) {
+                return this.createMediaObject(jpeg, 'image/jpeg');
+            }
+            // Nothing streamed yet and nothing cached: fall back to Scrypted's Snapshot plugin, which
+            // derives (and caches) a still from the rebroadcast prebuffer.
             throw new Error(`${this.getDisplayName()} does not support direct snapshot capture; derived from the WebRTC stream.`);
         }
 
@@ -1260,6 +1269,76 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
             this.console.error(`Failed to capture SimpliSafe snapshot for ${this.nativeCameraId}.`, err);
             throw err;
         }
+    }
+
+    /**
+     * Produce a still for a LiveKit (WebRTC) camera. When a stream is active we decode its latest
+     * H264 keyframe to JPEG and cache it; when idle we serve that cached JPEG immediately. This keeps
+     * HomeKit snapshots instant instead of cold-starting the WebRTC->RTSP path, which is slow and
+     * frequently times out as "Snapshot Failed" once the camera has gone idle for a while.
+     */
+    private async getLiveKitSnapshot(): Promise<Buffer | undefined> {
+        const keyframe = this.liveKitStream?.getKeyframe();
+        // Refresh from a live keyframe at most every few seconds; otherwise reuse the cached JPEG.
+        if (keyframe && Date.now() - this.snapshotCacheTime > 3_000) {
+            if (!this.snapshotRefresh) {
+                this.snapshotRefresh = this.decodeKeyframeToJpeg(keyframe)
+                    .then(jpeg => {
+                        if (jpeg?.length) {
+                            this.snapshotCache = jpeg;
+                            this.snapshotCacheTime = Date.now();
+                        }
+                        return jpeg;
+                    })
+                    .catch(err => {
+                        this.console.warn(`Failed to decode SimpliSafe keyframe snapshot for ${this.nativeCameraId}.`, err);
+                        return undefined;
+                    })
+                    .finally(() => { this.snapshotRefresh = undefined; });
+            }
+            // With no cached image yet, wait for the decode; otherwise serve the stale cache now and
+            // let the refresh finish in the background so this request stays fast.
+            if (!this.snapshotCache) {
+                await this.snapshotRefresh;
+            }
+        }
+        return this.snapshotCache;
+    }
+
+    /** Decode a single Annex-B H264 keyframe to a JPEG using ffmpeg. */
+    private async decodeKeyframeToJpeg(keyframe: Buffer): Promise<Buffer | undefined> {
+        const ffmpegPath = await mediaManager.getFFmpegPath();
+        return await new Promise<Buffer | undefined>((resolve, reject) => {
+            const args = [
+                '-hide_banner', '-loglevel', 'error',
+                '-f', 'h264',
+                '-i', 'pipe:0',
+                '-frames:v', '1',
+                '-f', 'mjpeg',
+                'pipe:1',
+            ];
+            const cp = spawn(ffmpegPath, args);
+            const out: Buffer[] = [];
+            const err: Buffer[] = [];
+            const timer = setTimeout(() => {
+                try { cp.kill('SIGKILL'); } catch { /* ignore */ }
+                reject(new Error('SimpliSafe snapshot decode timed out.'));
+            }, 5_000);
+            cp.stdout.on('data', d => out.push(d));
+            cp.stderr.on('data', d => err.push(d));
+            cp.on('error', e => { clearTimeout(timer); reject(e); });
+            cp.on('close', code => {
+                clearTimeout(timer);
+                const jpeg = Buffer.concat(out);
+                if (jpeg.length)
+                    resolve(jpeg);
+                else
+                    reject(new Error(`ffmpeg snapshot decode failed (code ${code}): ${Buffer.concat(err).toString().trim()}`));
+            });
+            cp.stdin.on('error', () => { /* ignore EPIPE if ffmpeg exits before we finish writing */ });
+            cp.stdin.write(keyframe);
+            cp.stdin.end();
+        });
     }
 
     async getPictureOptions(): Promise<ResponsePictureOptions[]> {
@@ -1404,7 +1483,12 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
         }
 
         try {
-            return await this.getLiveKitStream(details.uuid).startSession(session);
+            const control = await this.getLiveKitStream(details.uuid).startSession(session);
+            // Seed/refresh the snapshot cache from the now-warm stream so the HomeKit thumbnail is
+            // fresh and later idle snapshots answer instantly instead of cold-starting (and timing
+            // out). The stream sends a keyframe on connect; give it a moment to arrive.
+            setTimeout(() => { this.getLiveKitSnapshot().catch(() => { /* ignore */ }); }, 3_000);
+            return control;
         } catch (err) {
             this.console.error(`Failed to start SimpliSafe WebRTC stream for ${this.nativeCameraId}.`, err);
             throw err;
