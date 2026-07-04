@@ -486,12 +486,14 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
     });
 
     const handleSignal = async (data: WebSocket.RawData) => {
+        let messageCase: string | undefined;
         try {
             const bytes = data instanceof Buffer ? new Uint8Array(data)
                 : data instanceof ArrayBuffer ? new Uint8Array(data)
                 : new Uint8Array(data as any);
             const resp = SignalResponse.fromBinary(bytes);
             const msg = resp.message;
+            messageCase = msg.case;
 
             switch (msg.case) {
                 case 'join': {
@@ -600,6 +602,14 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
         }
         catch (err) {
             console.warn('Failed to handle LiveKit signaling message.', err);
+            // A failed offer exchange (e.g. werift crashing on an SFU renegotiation that adds an
+            // m-line) leaves the server waiting for an answer it will never get; it kicks the
+            // session seconds later regardless. Tear down now so the shared viewer resets and
+            // consumers reconnect immediately instead of streaming into a doomed session.
+            if (messageCase === 'offer') {
+                console.warn('SS:LiveKit offer negotiation failed; restarting subscriber connection.');
+                cleanup();
+            }
         }
     };
 
