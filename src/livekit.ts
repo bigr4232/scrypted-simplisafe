@@ -42,6 +42,18 @@ const SUBSCRIBE_VIDEO_CODECS = [
         ],
         parameters: 'level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f',
     }),
+    // Accept RTX retransmissions. Without this, the SFU has no channel to answer our NACKs and
+    // most upstream packet loss is unrecoverable (observed ~0.4% net video loss -> HomeKit frame
+    // drops). LiveKit's payload type mapping is stable (H264 on 125, its rtx on 126/apt=125), and
+    // werift keeps every remote rtx whose apt origin matches a local codec, so mirroring one pair
+    // is enough to accept them all. payloadType MUST be explicit: werift's constructor rewrites
+    // the apt parameter of any rtx codec it auto-assigns a payload type to.
+    new RTCRtpCodecParameters({
+        mimeType: 'video/rtx',
+        clockRate: 90000,
+        payloadType: 126,
+        parameters: 'apt=125',
+    }),
 ];
 const SUBSCRIBE_AUDIO_CODECS = [
     new RTCRtpCodecParameters({
@@ -233,6 +245,44 @@ class H264KeyframeCapturer {
     }
 }
 
+/**
+ * RTP sequence-continuity accounting for diagnosing packet loss. Tracks forward gaps (packets
+ * skipped), late arrivals (retransmissions/reordering filling earlier gaps), and duplicates.
+ * `lost` is net loss after late arrivals are credited back.
+ */
+class RtpSeqStats {
+    received = 0;
+    gapEvents = 0;
+    lost = 0;
+    reordered = 0;
+    private expected?: number;
+
+    onPacket(seq: number): void {
+        this.received++;
+        if (this.expected === undefined) {
+            this.expected = (seq + 1) & 0xffff;
+            return;
+        }
+        if (seq === this.expected) {
+            this.expected = (seq + 1) & 0xffff;
+            return;
+        }
+        const delta = (seq - this.expected) & 0xffff;
+        if (delta < 0x8000) {
+            // Jumped forward: delta packets were skipped.
+            this.gapEvents++;
+            this.lost += delta;
+            this.expected = (seq + 1) & 0xffff;
+        }
+        else {
+            // Behind the high-water mark: a late (retransmitted/reordered) packet filled a gap.
+            this.reordered++;
+            if (this.lost > 0)
+                this.lost--;
+        }
+    }
+}
+
 interface LiveKitViewer {
     pc: RTCPeerConnection;
     videoTrack?: MediaStreamTrack;
@@ -283,6 +333,25 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
     let videoTrack: MediaStreamTrack | undefined;
     let audioTrack: MediaStreamTrack | undefined;
     const keyframeCapturer = new H264KeyframeCapturer();
+    // Packet-loss diagnostics: sequence continuity at the earliest point we see LiveKit RTP.
+    const videoStats = new RtpSeqStats();
+    const audioStats = new RtpSeqStats();
+    let nackSends = 0;
+    let statsTimer: NodeJS.Timeout | undefined;
+    let lastStatsLine = '';
+    const startStatsLogging = () => {
+        if (statsTimer)
+            return;
+        statsTimer = setInterval(() => {
+            const line = `SS:rtpstats video recv=${videoStats.received} lost=${videoStats.lost} gaps=${videoStats.gapEvents} late=${videoStats.reordered}`
+                + ` | audio recv=${audioStats.received} lost=${audioStats.lost}`
+                + ` | nackSends=${nackSends}`;
+            if (line !== lastStatsLine) {
+                lastStatsLine = line;
+                dlog(line);
+            }
+        }, 10_000);
+    };
     let pingTimer: NodeJS.Timeout | undefined;
     let remoteDescriptionSet = false;
     const pendingCandidates: RTCIceCandidate[] = [];
@@ -341,6 +410,8 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
     const cleanup = () => {
         if (pingTimer)
             clearInterval(pingTimer);
+        if (statsTimer)
+            clearInterval(statsTimer);
         if (micMuteTimer)
             clearTimeout(micMuteTimer);
         try { ws.close(); } catch { /* ignore */ }
@@ -381,12 +452,30 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
                 videoTrack = track;
                 // Passively watch the video RTP to retain the latest keyframe for on-demand snapshots.
                 track.onReceiveRtp.subscribe(rtp => {
+                    videoStats.onPacket(rtp.header.sequenceNumber);
                     try { keyframeCapturer.onRtp(rtp); }
                     catch { /* ignore malformed packet */ }
                 });
+                // Observe werift's NACK handler so the stats show whether retransmission requests
+                // are actually being sent for the gaps we see.
+                try {
+                    const receiver = (pc!.getTransceivers() as any[])
+                        .find(t => t?.receiver?.tracks?.includes?.(track) || t?.kind === 'video')?.receiver;
+                    if (receiver) {
+                        dlog('SS:rtpstats video nackEnabled=', !!receiver.nackEnabled);
+                        receiver.nack?.onPacketLost?.subscribe?.(() => { nackSends++; });
+                    }
+                }
+                catch (e) {
+                    dlog('SS:rtpstats receiver introspection failed', e);
+                }
+                startStatsLogging();
             }
-            else if (track.kind === 'audio')
+            else if (track.kind === 'audio') {
                 audioTrack = track;
+                track.onReceiveRtp.subscribe(rtp => audioStats.onPacket(rtp.header.sequenceNumber));
+                startStatsLogging();
+            }
         });
     };
 
@@ -426,12 +515,20 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
                     const h264 = (offer.sdp.match(/a=(rtpmap|fmtp):.*(H264|h264).*/g) || []).join(' | ');
                     if (h264)
                         dlog('SS:LiveKit server H264 offer:', h264);
+                    // Loss diagnostics: does the server offer retransmission (rtx) / FEC, and does it
+                    // pair ssrcs for it (ssrc-group FID)?
+                    const resilience = (offer.sdp.match(/a=(rtpmap:\d+ (rtx|red|ulpfec|flexfec).*|fmtp:\d+ apt=\d+|ssrc-group:FID.*)/g) || []).join(' | ');
+                    if (resilience)
+                        dlog('SS:LiveKit server offer resilience:', resilience);
                     await pc.setRemoteDescription({ type: 'offer', sdp: offer.sdp });
                     remoteDescriptionSet = true;
                     for (const candidate of pendingCandidates.splice(0))
                         await pc.addIceCandidate(candidate).catch(() => { /* ignore */ });
                     const answer = await pc.createAnswer();
                     await pc.setLocalDescription(answer);
+                    const answerVideo = (answer.sdp.match(/a=rtpmap:.*/g) || []).join(' | ');
+                    if (answerVideo)
+                        dlog('SS:LiveKit our answer rtpmap:', answerVideo);
                     send({
                         case: 'answer',
                         value: new SessionDescription({ type: 'answer', sdp: answer.sdp, id: offer.id }),
