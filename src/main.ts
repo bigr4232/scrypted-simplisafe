@@ -606,6 +606,9 @@ class SimplisafeApi extends EventEmitter {
     }
 
     private handleSocketMessage(raw: RawData): void {
+        if (this.debug) {
+            this.log.log(`SimpliSafe realtime: raw message: ${raw.toString()}`);
+        }
         let message: SimplisafeRealtimeMessage;
         try {
             message = JSON.parse(raw.toString());
@@ -647,17 +650,29 @@ class SimplisafeApi extends EventEmitter {
         }
 
         if (data.sid && this.subId && data.sid !== this.subId) {
+            if (this.debug) {
+                this.log.log(`SimpliSafe realtime: dropping event for other subscription sid=${data.sid} (ours=${this.subId}).`);
+            }
             return;
         }
 
         switch (data.eventCid) {
         case 1170:
+            if (this.debug) {
+                this.log.log(`SimpliSafe realtime: camera motion event payload: ${JSON.stringify(data)}`);
+            }
             this.emit(EVENT_TYPES.CAMERA_MOTION, data);
             break;
         case 1458:
+            if (this.debug) {
+                this.log.log(`SimpliSafe realtime: doorbell event payload: ${JSON.stringify(data)}`);
+            }
             this.emit(EVENT_TYPES.DOORBELL, data);
             break;
         default:
+            if (this.debug) {
+                this.log.log(`SimpliSafe realtime: unhandled event cid=${data.eventCid ?? 'unknown'} payload: ${JSON.stringify(data)}`);
+            }
             break;
         }
     }
@@ -968,7 +983,10 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     private desiredOnline = true;
     private motionResetTimer?: NodeJS.Timeout;
     private readonly motionHoldDurationMs = 5_000;
-    motionDetected?: boolean;
+    // NOTE: motionDetected must NOT be re-declared as a class field here. Under
+    // useDefineForClassFields (target ESNext) a field declaration installs an own
+    // property that shadows ScryptedDeviceBase's prototype accessor, so assignments
+    // would never reach Scrypted device state (or HomeKit).
     motionDetectedTimestamp?: number;
     private intercomProcess?: ChildProcess;
     private intercomSocket?: dgram.Socket;
@@ -1617,6 +1635,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
     private readonly cameraDetails = new Map<string, SimplisafeCameraDetails>();
     private readonly nativeIdToUuid = new Map<string, string>();
     private readonly uuidToNativeId = new Map<string, string>();
+    private readonly identifierToNativeIds = new Map<string, Set<string>>();
     private readonly currentNativeIds = new Set<string>();
     private readonly readinessTasks = new Map<string, Promise<void>>();
     private readonly upgradedNativeIds = new Set<string>();
@@ -1680,17 +1699,60 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         this.uuidToNativeId.delete(uuid.toLowerCase());
     }
 
+    private registerCameraIdentifiers(nativeId: string, details: SimplisafeCameraDetails): void {
+        const normalizedNativeId = this.normalizeNativeId(nativeId);
+        this.unregisterCameraIdentifiers(normalizedNativeId);
+        const identifiers: (string | undefined)[] = [
+            (details as any)?.serialNumber,
+            (details as any)?.serial,
+            (details as any)?.deviceSerial,
+            (details as any)?.macAddress,
+            (details as any)?.mac,
+            details.uuid,
+        ];
+        for (const identifier of identifiers) {
+            if (typeof identifier !== 'string') {
+                continue;
+            }
+            const trimmed = identifier.trim();
+            if (!trimmed) {
+                continue;
+            }
+            for (const key of new Set([trimmed.toLowerCase(), normalizeIdSegment(trimmed)])) {
+                if (!key) {
+                    continue;
+                }
+                let nativeIds = this.identifierToNativeIds.get(key);
+                if (!nativeIds) {
+                    nativeIds = new Set<string>();
+                    this.identifierToNativeIds.set(key, nativeIds);
+                }
+                nativeIds.add(normalizedNativeId);
+            }
+        }
+    }
+
+    private unregisterCameraIdentifiers(nativeId: string): void {
+        const normalizedNativeId = this.normalizeNativeId(nativeId);
+        for (const [key, nativeIds] of this.identifierToNativeIds) {
+            if (nativeIds.delete(normalizedNativeId) && nativeIds.size === 0) {
+                this.identifierToNativeIds.delete(key);
+            }
+        }
+    }
+
     private handleCameraMotionEvent(event: SimplisafeRealtimeEvent): void {
         const nativeIds = this.resolveNativeIdsFromEvent(event);
         if (nativeIds.length === 0) {
+            const identifier = event.sensorSerial
+                || event.cameraSerial
+                || event.serial
+                || event.deviceSerial
+                || event.cameraUuid
+                || event.uuid;
+            this.console.warn(`SimpliSafe motion event could not be matched to a camera. identifier=${identifier ?? 'unknown'}`);
             if (this.debug) {
-                const identifier = event.sensorSerial
-                    || event.cameraSerial
-                    || event.serial
-                    || event.deviceSerial
-                    || event.cameraUuid
-                    || event.uuid;
-                this.console.warn(`SimpliSafe motion event could not be matched to a camera. identifier=${identifier ?? 'unknown'}`);
+                this.console.warn(`Unmatched motion event payload: ${JSON.stringify(event)}`);
             }
             return;
         }
@@ -1723,13 +1785,27 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
 
         const resolved = new Set<string>();
         for (const candidate of candidates) {
+            // The event may carry the nativeId itself, a bare serial/uuid, or a
+            // serial that only matches after full segment normalization.
             const normalized = this.normalizeNativeId(candidate);
             if (this.cameraDetails.has(normalized)) {
                 resolved.add(normalized);
             }
+            const prefixed = `simplisafe-camera-${normalizeIdSegment(candidate)}`;
+            if (this.cameraDetails.has(prefixed)) {
+                resolved.add(prefixed);
+            }
             const mapped = this.uuidToNativeId.get(candidate) ?? this.uuidToNativeId.get(candidate.toLowerCase());
             if (mapped) {
                 resolved.add(mapped);
+            }
+            for (const key of new Set([normalized, normalizeIdSegment(candidate)])) {
+                const indexed = this.identifierToNativeIds.get(key);
+                if (indexed) {
+                    for (const nativeId of indexed) {
+                        resolved.add(nativeId);
+                    }
+                }
             }
         }
 
@@ -1955,6 +2031,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         }
 
         this.cameraDetails.set(normalized, details);
+        this.registerCameraIdentifiers(normalized, details);
         this.pendingRemoval.delete(normalized);
 
         if (details.uuid) {
@@ -2090,6 +2167,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                     this.console.warn(`Duplicate cached SimpliSafe camera nativeId detected: ${nativeId}. Overwriting existing entry.`);
                 }
                 this.cameraDetails.set(nativeId, camera);
+                this.registerCameraIdentifiers(nativeId, camera);
                 if (camera.uuid) {
                     this.nativeIdToUuid.set(nativeId, camera.uuid);
                     this.associateUuidWithNativeId(camera.uuid, nativeId);
@@ -2293,6 +2371,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         if (!details) {
             details = buildPlaceholderCameraDetails(lookupNativeId, undefined, undefined, simplisafeUuid);
             this.cameraDetails.set(lookupNativeId, details);
+            this.registerCameraIdentifiers(lookupNativeId, details);
             if (!simplisafeUuid && details.uuid) {
                 simplisafeUuid = details.uuid;
                 this.nativeIdToUuid.set(lookupNativeId, simplisafeUuid);
@@ -2541,6 +2620,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                 }
                 this.nativeIdToUuid.delete(legacy);
                 this.cameraDetails.delete(legacy);
+                this.unregisterCameraIdentifiers(legacy);
                 this.cameraReady.delete(legacy);
                 this.cameraDesiredOnline.delete(legacy);
                 this.cameraLastOnline.delete(legacy);
