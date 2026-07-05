@@ -319,6 +319,8 @@ interface LiveKitViewer {
      * monotonic counters so the stream stays continuous across consumer-session (source) switches.
      */
     writeMic: (rtp: RtpPacket) => void;
+    /** True while a talk-back session currently owns the mic (and briefly after it goes idle). */
+    isMicActive: () => boolean;
 }
 
 /**
@@ -910,6 +912,7 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
         ensureMicTrack,
         claimMic,
         writeMic,
+        isMicActive: () => !!micOwner,
     };
 }
 
@@ -1041,6 +1044,9 @@ export class LiveKitCameraStream {
     private activeGen = 0;
     private rolloverTimer?: NodeJS.Timeout;
     private streamEndedCbs: (() => void)[] = [];
+    // Outstanding device-level Intercom holds (acquireMicSink). These write to the mic track
+    // directly without claiming it, so they count as talk-back activity for rollover deferral.
+    private micSinkHolds = 0;
 
     constructor(
         private getDetails: () => Promise<LiveKitDetails>,
@@ -1136,6 +1142,22 @@ export class LiveKitCameraStream {
     private async rollover(oldViewer: LiveKitViewer): Promise<void> {
         if (this.viewer !== oldViewer || this.refcount === 0)
             return;
+        // Defer while talk-back is in progress — the shared mic track lives on the old session, so
+        // rolling over mid-talk cuts it off. Re-check every couple seconds until a drop-dead point
+        // that still leaves time to pre-warm the replacement before the server kills the old
+        // session at token expiry (at which point the talk would die anyway).
+        if (oldViewer.isMicActive() || this.micSinkHolds > 0) {
+            const dropDeadMs = (oldViewer.tokenExp ?? 0) * 1000 - 12_000;
+            if (Date.now() < dropDeadMs) {
+                this.dlog('SS:LiveKit rollover deferred: talk-back in progress.');
+                this.rolloverTimer = setTimeout(() => {
+                    this.rollover(oldViewer).catch(err =>
+                        this.dlog('SS:LiveKit rollover failed; session rides to expiry and self-heals.', err));
+                }, 2000);
+                return;
+            }
+            this.dlog('SS:LiveKit rollover proceeding despite active talk-back: token expiry imminent.');
+        }
         this.dlog('SS:LiveKit rollover: pre-warming replacement session before token expiry.');
         const details = await this.getDetails();
         const next = await startLiveKitViewer(details, this.console, this.debug, this.makeSinks(++this.genCounter));
@@ -1214,11 +1236,13 @@ export class LiveKitCameraStream {
     async acquireMicSink(): Promise<{ track: MediaStreamTrack; release: () => void }> {
         const viewer = await this.ensureViewer();
         this.refcount++;
+        this.micSinkHolds++;
         let released = false;
         const release = () => {
             if (released)
                 return;
             released = true;
+            this.micSinkHolds = Math.max(0, this.micSinkHolds - 1);
             this.release();
         };
         try {
