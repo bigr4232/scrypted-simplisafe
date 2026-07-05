@@ -118,6 +118,14 @@ type ConsoleLike = Pick<Console, 'log' | 'warn' | 'error'>;
 const LK_PROTOCOL = 15;
 const LK_VERSION = '2.20.0';
 
+// LiveKit's join response includes its TURN server, and @koush/ice's TurnClient keeps refreshing
+// its allocation after pc.close() — every 10-minute session rollover leaks a refresh loop that
+// spams unhandledRejection TransactionFailed indefinitely. Filtering TURN out was tried
+// (2026-07-05) and BROKE streaming: the SimpliSafe SFU is not directly reachable, media goes via
+// the relay, and the server drops the participant (signaling ws closes) when ICE cannot form. So
+// TURN must stay on; the refresh leak needs fixing in werift instead.
+const USE_TURN_SERVERS = true;
+
 /**
  * Flatten LiveKit ICE servers (protobuf ICEServer with a `urls` array) into werift's expected
  * shape (one entry per url string).
@@ -130,12 +138,19 @@ function normalizeIceServers(iceServers: any[] | undefined): any[] {
         const urls = ice?.urls ?? ice?.url;
         const credential = ice?.credential ?? ice?.password;
         const username = ice?.username;
+        const push = (url: unknown) => {
+            if (typeof url !== 'string')
+                return;
+            if (!USE_TURN_SERVERS && /^turns?:/i.test(url.trim()))
+                return;
+            ret.push({ urls: url, username, credential });
+        };
         if (Array.isArray(urls)) {
             for (const url of urls)
-                ret.push({ urls: url, username, credential });
+                push(url);
         }
-        else if (typeof urls === 'string') {
-            ret.push({ urls, username, credential });
+        else {
+            push(urls);
         }
     }
     return ret;
@@ -506,7 +521,45 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
         return true;
     };
 
+    // werift never stops the TURN allocation-refresh loop or closes its UDP socket on pc.close()
+    // (@koush/ice's TurnTransport has no close method, and TurnClient.refreshHandle is never
+    // cancelled), so every closed session leaks a refresh loop that spams unhandledRejection
+    // TransactionFailed once its allocation credentials lapse. Stop them explicitly.
+    const stopTurnClients = (peer?: RTCPeerConnection) => {
+        for (const ice of (peer as any)?.iceTransports ?? []) {
+            for (const protocol of ice?.connection?.protocols ?? []) {
+                const turn = protocol?.turn;
+                if (!turn)
+                    continue;
+                try { turn.refreshHandle?.cancel?.(); } catch { /* ignore */ }
+                // The cancelled refresh loop still completes its in-flight iteration (it re-checks
+                // its flag only after the ~500s sleep), issuing one final REFRESH from a detached
+                // async context. Left alone that request can only time out, surfacing as an
+                // unhandledRejection TransactionTimeout minutes after every close; resolve it
+                // immediately instead.
+                try { turn.request = async () => []; } catch { /* ignore */ }
+                // Stop the retry timers of transactions already in flight. Their promises are
+                // never settled, which is rejection-free and GC-safe.
+                try {
+                    for (const transaction of Object.values(turn.transactions ?? {}))
+                        (transaction as any)?.cancel?.();
+                } catch { /* ignore */ }
+                const transport = turn.transport;
+                if (!transport)
+                    continue;
+                // Swap send out BEFORE closing the socket: pc.close() completes asynchronously
+                // (DTLS close_notify, final RTCP), and any late send hitting the closed dgram
+                // socket rejects uncaught ('Not running') from werift's send promise.
+                try { transport.send = async () => { /* socket closed */ }; } catch { /* ignore */ }
+                try { transport.close?.(); } catch { /* ignore */ }
+            }
+        }
+    };
+
     const cleanup = () => {
+        // Re-entrant: pc.close() below re-fires connectionStateChange('closed') into cleanup.
+        if (closed)
+            return;
         closed = true;
         if (pingTimer)
             clearInterval(pingTimer);
@@ -519,6 +572,8 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
         try { ws.close(); } catch { /* ignore */ }
         try { pc?.close(); } catch { /* ignore */ }
         try { publisherPc?.close(); } catch { /* ignore */ }
+        stopTurnClients(pc);
+        stopTurnClients(publisherPc);
         for (const cb of closedCallbacks.splice(0)) {
             try { cb(); } catch { /* ignore */ }
         }
@@ -552,8 +607,14 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
             });
         });
 
-        pc.connectionStateChange.subscribe(state =>
-            dlog(`SS:LiveKit subscriber pc ${state} at ${ts()}`));
+        pc.connectionStateChange.subscribe(state => {
+            dlog(`SS:LiveKit subscriber pc ${state} at ${ts()}`);
+            // A post-startup failure gets no leave message, so without this the viewer lingers as
+            // a zombie: onClosed never fires, consumers hang on frozen video, and ensureViewer
+            // keeps handing out the dead session.
+            if (state === 'failed' || state === 'closed')
+                cleanup();
+        });
         pc.iceConnectionStateChange.subscribe(state =>
             dlog(`SS:LiveKit subscriber ice ${state} at ${ts()}`));
 
@@ -776,7 +837,12 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
     ws.on('message', (data: WebSocket.RawData) => {
         signalQueue = signalQueue.then(() => handleSignal(data));
     });
-    ws.on('close', () => dlog('SS:LiveKit ws closed.'));
+    ws.on('close', () => {
+        dlog('SS:LiveKit ws closed.');
+        // An unexpected websocket drop (network blip, server restart) must tear the viewer down so
+        // consumers are notified and the next stream request builds a fresh session.
+        cleanup();
+    });
 
     // Wait for the subscriber peer connection to connect and deliver at least a video track.
     await new Promise<void>((resolve, reject) => {
@@ -1081,9 +1147,18 @@ export class LiveKitCameraStream {
         return viewer.ensureMicTrack();
     }
 
-    /** Fired when the stream truly ends (active session died with no replacement). */
-    onStreamEnded(cb: () => void): void {
+    /**
+     * Fired when the stream truly ends (active session died with no replacement). Returns an
+     * unregister function so consumer sessions that end first don't accumulate here for the
+     * stream's lifetime.
+     */
+    onStreamEnded(cb: () => void): () => void {
         this.streamEndedCbs.push(cb);
+        return () => {
+            const index = this.streamEndedCbs.indexOf(cb);
+            if (index >= 0)
+                this.streamEndedCbs.splice(index, 1);
+        };
     }
 
     private fireStreamEnded(): void {
@@ -1192,6 +1267,15 @@ export class LiveKitCameraStream {
         if (this.viewer && this.viewer.isHealthy())
             return this.viewer;
 
+        if (this.viewer) {
+            // Unhealthy but not yet torn down: close it (which fires onClosed and clears
+            // viewer/viewerPromise) so the request below builds a fresh session instead of being
+            // handed the dead one via the stale viewerPromise.
+            try { this.viewer.close(); } catch { /* ignore */ }
+            this.viewer = undefined;
+            this.viewerPromise = undefined;
+        }
+
         if (!this.viewerPromise) {
             this.viewerPromise = (async () => {
                 const details = await this.getDetails();
@@ -1289,10 +1373,15 @@ async function bridgeToScryptedSession(
         codecs,
     });
 
+    // The relays outlive this session (they are camera-lifetime), so every subscription made here
+    // must be disposed on session end — otherwise each session permanently leaks a per-packet
+    // callback writing into its dead tracks.
+    const sessionDisposers: (() => void)[] = [];
+
     // Outbound video, fed from the stream's stable relay (survives session rollovers).
     const videoOut = new MediaStreamTrack({ kind: 'video' });
     consumerPc.addTransceiver(videoOut, { direction: 'sendonly' });
-    stream.videoRelay.onReceiveRtp.subscribe(rtp => videoOut.writeRtp(rtp));
+    sessionDisposers.push(stream.videoRelay.onReceiveRtp.subscribe(rtp => videoOut.writeRtp(rtp)).unSubscribe);
 
     // Audio is bidirectional. We send the camera's audio to the consumer AND accept talk-back (the
     // viewer's microphone) on the same transceiver: Scrypted's WebRTC plugin implements HomeKit
@@ -1302,7 +1391,7 @@ async function bridgeToScryptedSession(
     if (audioCodec) {
         const audioOut = new MediaStreamTrack({ kind: 'audio' });
         consumerPc.addTransceiver(audioOut, { direction: 'sendrecv' });
-        stream.audioRelay.onReceiveRtp.subscribe(rtp => audioOut.writeRtp(rtp));
+        sessionDisposers.push(stream.audioRelay.onReceiveRtp.subscribe(rtp => audioOut.writeRtp(rtp)).unSubscribe);
     }
     else {
         consumerPc.addTransceiver('audio', { direction: 'recvonly' });
@@ -1355,6 +1444,9 @@ async function bridgeToScryptedSession(
         await connectRTCSignalingClients(console, weriftSession, consumerSetup, session, sessionSetup);
 
     const control = new SimplisafeRTCSessionControl(() => {
+        for (const dispose of sessionDisposers.splice(0)) {
+            try { dispose(); } catch { /* ignore */ }
+        }
         try { consumerPc.close(); } catch { /* ignore */ }
         // Release this consumer's hold on the shared LiveKit connection; the streamer tears the
         // upstream down only when the last consumer leaves. The shared mic track is not torn down
@@ -1368,9 +1460,9 @@ async function bridgeToScryptedSession(
     });
     // End the consumer session only when the stream truly ends (active session died with no
     // replacement) — NOT on session rollovers, which consumers ride through via the relays.
-    stream.onStreamEnded(() => {
+    sessionDisposers.push(stream.onStreamEnded(() => {
         control.endSession().catch(() => { /* ignore */ });
-    });
+    }));
 
     return control;
 }
