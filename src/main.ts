@@ -38,8 +38,6 @@ import { ChildProcess, spawn } from 'child_process';
 import { EventEmitter } from 'events';
 import crypto from 'crypto';
 import dgram from 'dgram';
-import dns from 'dns';
-const { lookup } = dns.promises;
 import jpegExtract from 'jpeg-extract';
 import WebSocket, { RawData } from 'ws';
 
@@ -61,7 +59,10 @@ const subscriptionCacheTime = 3000;
 const cameraCacheTime = 15000;
 const rateLimitInitialInterval = 60_000;
 const rateLimitMaxInterval = 2 * 60 * 60 * 1000;
-const mediaHostTtl = 5 * 60 * 1000;
+// Media requests carry the SimpliSafe bearer token, so they must go to the hostname with TLS
+// verification enabled — never to a resolved IP with verification disabled (MITM could steal the
+// token, which grants full account access including the alarm).
+const SS_MEDIA_HOST = 'media.simplisafe.com';
 // Recording providers known to serve the SimpliSafe cloud FLV streaming endpoint.
 // Add the value logged by SS:isUnsupported here once confirmed it works with the FLV path.
 const SUPPORTED_RECORDING_PROVIDERS = new Set<string>(['simplisafe']);
@@ -976,8 +977,6 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     private liveKitStream?: LiveKitCameraStream;
     private streamOptions?: ResponseMediaStreamOptions[];
     private pictureOptions?: ResponsePictureOptions[];
-    private mediaHost?: string;
-    private mediaHostTimestamp = 0;
     private simplisafeUuid?: string;
     private ready = false;
     private desiredOnline = true;
@@ -1217,10 +1216,12 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
 
             const width = selected.video?.width ?? 1920;
             const accessToken = await this.api.getAccessToken();
-            const host = await this.getMediaHost();
-            const url = `https://${host}/v1/${details.uuid}/flv?x=${width}&audioEncoding=AAC`;
+            const url = `https://${SS_MEDIA_HOST}/v1/${details.uuid}/flv?x=${width}&audioEncoding=AAC`;
             const inputArguments = [
                 '-re',
+                // ffmpeg skips TLS certificate verification by default; the Authorization header
+                // below must not be exposed to a MITM.
+                '-tls_verify', '1',
                 '-headers',
                 `Authorization: Bearer ${accessToken}`,
                 '-i',
@@ -1271,15 +1272,13 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
                 ?? 1920;
 
             const accessToken = await this.api.getAccessToken();
-            const host = await this.getMediaHost();
-            const snapshotUrl = `https://${host}/v1/${details.uuid}/mjpg?x=${width}&fr=1`;
+            const snapshotUrl = `https://${SS_MEDIA_HOST}/v1/${details.uuid}/mjpg?x=${width}&fr=1`;
 
             const image = await jpegExtract({
                 url: snapshotUrl,
                 headers: {
                     Authorization: `Bearer ${accessToken}`,
                 },
-                rejectUnauthorized: false,
             });
 
             return this.createMediaObject(image, 'image/jpeg');
@@ -1436,27 +1435,6 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
         }
 
         return height;
-    }
-
-    private async getMediaHost(): Promise<string> {
-        const now = Date.now();
-        if (!this.mediaHost || now - this.mediaHostTimestamp > mediaHostTtl) {
-            try {
-                const result = await lookup('media.simplisafe.com');
-                this.mediaHost = result.address;
-                this.mediaHostTimestamp = now;
-            } catch (err) {
-                if (!this.mediaHost) {
-                    this.console.warn('Unable to resolve media.simplisafe.com, falling back to hostname.', err);
-                    this.mediaHost = 'media.simplisafe.com';
-                    this.mediaHostTimestamp = now;
-                } else {
-                    this.console.warn('Unable to resolve media.simplisafe.com, using cached host.', err);
-                }
-            }
-        }
-
-        return this.mediaHost!;
     }
 
     private getCameraName(details: SimplisafeCameraDetails): string {
