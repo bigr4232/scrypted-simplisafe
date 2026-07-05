@@ -89,6 +89,7 @@ import {
     SignalRequest,
     SignalResponse,
     SignalTarget,
+    StreamState,
     TrackSource,
     TrackType,
     TrickleRequest,
@@ -284,9 +285,19 @@ class RtpSeqStats {
 }
 
 interface LiveKitViewer {
-    pc: RTCPeerConnection;
-    videoTrack?: MediaStreamTrack;
-    audioTrack?: MediaStreamTrack;
+    /** Negotiated codec parameters (stable across sessions — the payload-type mapping is forced). */
+    videoCodec?: RTCRtpCodecParameters;
+    audioCodec?: RTCRtpCodecParameters;
+    /**
+     * Expiry (unix seconds) of the token this session joined with. SimpliSafe's server enforces it:
+     * media stops at exp and a leave follows. LiveKitCameraStream pre-warms a replacement session
+     * shortly before this deadline and switches consumers over.
+     */
+    tokenExp?: number;
+    /** False once the viewer is torn down or its current peer connection failed. */
+    isHealthy: () => boolean;
+    /** Register a callback fired exactly when the viewer is torn down (leave/expiry/failure). */
+    onClosed: (cb: () => void) => void;
     close: () => void;
     /** The most recent decode-ready H264 keyframe (Annex-B SPS+PPS+IDR), if any has been seen. */
     getKeyframe: () => Buffer | undefined;
@@ -314,8 +325,73 @@ interface LiveKitViewer {
  * Connect to LiveKit as a subscriber and return the negotiated peer connection plus the received
  * media tracks.
  */
-async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike, debug: () => boolean): Promise<LiveKitViewer> {
+/**
+ * Rewrites RTP sequence numbers and timestamps so that packets from successive sources (the
+ * subscriber peer connection is rebuilt on every session resume, with fresh SSRC/seq/ts bases)
+ * form one continuous stream. Offsets are constant per source, so intra-source ordering, gaps,
+ * and retransmissions are preserved; across a source switch the output continues just after the
+ * previous source's last packet, advanced by wall-clock elapsed time.
+ */
+class RtpRebaser {
+    private gen = -1;
+    private seqOffset = 0;
+    private tsOffset = 0;
+    private lastOutSeq = 0;
+    private lastOutTs = 0;
+    private lastWallMs = 0;
+    private started = false;
+
+    constructor(private clockRate: number) {
+    }
+
+    rebase(gen: number, rtp: RtpPacket): RtpPacket {
+        const header = rtp.header;
+        if (gen !== this.gen) {
+            this.gen = gen;
+            if (this.started) {
+                const elapsedMs = Math.max(20, Date.now() - this.lastWallMs);
+                const tsAdvance = Math.round(elapsedMs * this.clockRate / 1000);
+                // Margin past the last emitted seq guards against a slightly stale anchor (late
+                // retransmits can move lastOutSeq backwards a few packets).
+                this.seqOffset = (this.lastOutSeq + 16 - header.sequenceNumber) & 0xffff;
+                this.tsOffset = ((this.lastOutTs + tsAdvance - header.timestamp) >>> 0);
+            }
+        }
+        this.started = true;
+        header.sequenceNumber = (header.sequenceNumber + this.seqOffset) & 0xffff;
+        header.timestamp = (header.timestamp + this.tsOffset) >>> 0;
+        this.lastOutSeq = header.sequenceNumber;
+        this.lastOutTs = header.timestamp;
+        this.lastWallMs = Date.now();
+        return rtp;
+    }
+}
+
+// Decode a JWT's payload without verifying (diagnostics only — identity/expiry of LiveKit tokens).
+function jwtClaims(token: string): any {
+    try {
+        return JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
+    }
+    catch {
+        return undefined;
+    }
+}
+
+/**
+ * RTP sinks a viewer delivers its received media into. Provided by LiveKitCameraStream, which owns
+ * the stable consumer-facing relays and switches the active source viewer across session rollovers.
+ */
+interface ViewerSinks {
+    video: (rtp: RtpPacket) => void;
+    audio: (rtp: RtpPacket) => void;
+}
+
+async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike, debug: () => boolean, sinks: ViewerSinks): Promise<LiveKitViewer> {
     const dlog = (...args: any[]) => { if (debug()) console.log(...args); };
+    const joinClaims = jwtClaims(details.userToken);
+    if (joinClaims)
+        dlog(`SS:LiveKit join token claims sub=${joinClaims.sub} jti=${joinClaims.jti} room=${joinClaims.video?.room}`
+            + ` nbf=${joinClaims.nbf} exp=${joinClaims.exp} ttl=${joinClaims.exp - joinClaims.nbf}s`);
     const base = details.liveKitURL.replace(/\/$/, '');
     const params = new URLSearchParams({
         access_token: details.userToken,
@@ -333,27 +409,48 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
     let videoTrack: MediaStreamTrack | undefined;
     let audioTrack: MediaStreamTrack | undefined;
     const keyframeCapturer = new H264KeyframeCapturer();
+    const closedCallbacks: (() => void)[] = [];
     // Packet-loss diagnostics: sequence continuity at the earliest point we see LiveKit RTP.
     const videoStats = new RtpSeqStats();
     const audioStats = new RtpSeqStats();
     let nackSends = 0;
     let statsTimer: NodeJS.Timeout | undefined;
     let lastStatsLine = '';
+    // Dead-window diagnostics: the upstream feed intermittently stops delivering video RTP for
+    // multiple seconds (kills long-lived downstream sessions like HA/rebroadcast clients). Track
+    // the last video packet arrival and log the exact start/end of any multi-second gap so it can
+    // be correlated with signaling events (streamStateUpdate, mute, renegotiation) and pc state.
+    const ts = () => new Date().toISOString().slice(11, 23);
+    let lastVideoRtpMs = 0;
+    let videoGapFlaggedAt = 0;
+    let gapTimer: NodeJS.Timeout | undefined;
     const startStatsLogging = () => {
         if (statsTimer)
             return;
         statsTimer = setInterval(() => {
+            const vidAge = lastVideoRtpMs ? Date.now() - lastVideoRtpMs : -1;
             const line = `SS:rtpstats video recv=${videoStats.received} lost=${videoStats.lost} gaps=${videoStats.gapEvents} late=${videoStats.reordered}`
                 + ` | audio recv=${audioStats.received} lost=${audioStats.lost}`
                 + ` | nackSends=${nackSends}`;
             if (line !== lastStatsLine) {
                 lastStatsLine = line;
-                dlog(line);
+                dlog(`${line} | vidAge=${vidAge}ms at ${ts()}`);
             }
         }, 10_000);
+        gapTimer = setInterval(() => {
+            if (!lastVideoRtpMs || videoGapFlaggedAt)
+                return;
+            const silentMs = Date.now() - lastVideoRtpMs;
+            if (silentMs > 1500) {
+                videoGapFlaggedAt = lastVideoRtpMs;
+                dlog(`SS:rtpgap video silent ${(silentMs / 1000).toFixed(1)}s at ${ts()}`
+                    + ` (pc=${pc?.connectionState}/${pc?.iceConnectionState})`);
+            }
+        }, 500);
     };
     let pingTimer: NodeJS.Timeout | undefined;
     let remoteDescriptionSet = false;
+    let closed = false;
     const pendingCandidates: RTCIceCandidate[] = [];
 
     // Publisher (outbound) peer connection state, created lazily when the first mic track is
@@ -408,15 +505,21 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
     };
 
     const cleanup = () => {
+        closed = true;
         if (pingTimer)
             clearInterval(pingTimer);
         if (statsTimer)
             clearInterval(statsTimer);
+        if (gapTimer)
+            clearInterval(gapTimer);
         if (micMuteTimer)
             clearTimeout(micMuteTimer);
         try { ws.close(); } catch { /* ignore */ }
         try { pc?.close(); } catch { /* ignore */ }
         try { publisherPc?.close(); } catch { /* ignore */ }
+        for (const cb of closedCallbacks.splice(0)) {
+            try { cb(); } catch { /* ignore */ }
+        }
     };
 
     const send = (message: SignalRequest['message']) => {
@@ -447,19 +550,33 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
             });
         });
 
+        pc.connectionStateChange.subscribe(state =>
+            dlog(`SS:LiveKit subscriber pc ${state} at ${ts()}`));
+        pc.iceConnectionStateChange.subscribe(state =>
+            dlog(`SS:LiveKit subscriber ice ${state} at ${ts()}`));
+
+        const myPc = pc;
         pc.onTrack.subscribe(track => {
             if (track.kind === 'video') {
                 videoTrack = track;
-                // Passively watch the video RTP to retain the latest keyframe for on-demand snapshots.
                 track.onReceiveRtp.subscribe(rtp => {
+                    const now = Date.now();
+                    if (videoGapFlaggedAt) {
+                        dlog(`SS:rtpgap video resumed after ${((now - videoGapFlaggedAt) / 1000).toFixed(1)}s at ${ts()}`);
+                        videoGapFlaggedAt = 0;
+                    }
+                    lastVideoRtpMs = now;
                     videoStats.onPacket(rtp.header.sequenceNumber);
+                    // Retain the latest keyframe (for on-demand snapshots), then hand the packet to
+                    // the stream-level sink (which rebases seq/ts across session rollovers).
                     try { keyframeCapturer.onRtp(rtp); }
                     catch { /* ignore malformed packet */ }
+                    sinks.video(rtp);
                 });
                 // Observe werift's NACK handler so the stats show whether retransmission requests
                 // are actually being sent for the gaps we see.
                 try {
-                    const receiver = (pc!.getTransceivers() as any[])
+                    const receiver = (myPc.getTransceivers() as any[])
                         .find(t => t?.receiver?.tracks?.includes?.(track) || t?.kind === 'video')?.receiver;
                     if (receiver) {
                         dlog('SS:rtpstats video nackEnabled=', !!receiver.nackEnabled);
@@ -473,7 +590,10 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
             }
             else if (track.kind === 'audio') {
                 audioTrack = track;
-                track.onReceiveRtp.subscribe(rtp => audioStats.onPacket(rtp.header.sequenceNumber));
+                track.onReceiveRtp.subscribe(rtp => {
+                    audioStats.onPacket(rtp.header.sequenceNumber);
+                    sinks.audio(rtp);
+                });
                 startStatsLogging();
             }
         });
@@ -499,7 +619,8 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
                 case 'join': {
                     const join = msg.value;
                     dlog('SS:LiveKit join subscriberPrimary=', join.subscriberPrimary,
-                        'iceServers=', join.iceServers?.length, 'pingInterval=', join.pingInterval);
+                        'iceServers=', join.iceServers?.length, 'pingInterval=', join.pingInterval,
+                        'sid=', join.participant?.sid);
                     joinIceServers = join.iceServers as any[];
                     setupPeerConnection(join.iceServers as any[]);
                     const intervalMs = (join.pingInterval || 30) * 1000;
@@ -592,11 +713,44 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
                     if (msg.value.track?.type === TrackType.AUDIO && msg.value.track?.sid)
                         micSid = msg.value.track.sid;
                     break;
-                case 'leave':
-                    dlog('SS:LiveKit server requested leave.');
+                case 'leave': {
+                    const l = msg.value;
+                    dlog(`SS:LiveKit server requested leave. reason=${l.reason} action=${l.action}`
+                        + ` canReconnect=${l.canReconnect} at ${ts()}`);
                     cleanup();
                     break;
+                }
+                case 'refreshToken': {
+                    // The server refreshes the access token every ~5 minutes. Signaling-level resume
+                    // with it is a dead end for us (the server demands an ICE restart + DTLS
+                    // continuation werift can't do), so survival across the enforced 10-minute token
+                    // expiry is handled by LiveKitCameraStream pre-warming a whole new session.
+                    const claims = jwtClaims(msg.value);
+                    if (claims)
+                        dlog(`SS:LiveKit refreshToken claims sub=${claims.sub}`
+                            + ` nbf=${claims.nbf} exp=${claims.exp} ttl=${claims.exp - claims.nbf}s at ${ts()}`);
+                    break;
+                }
+                case 'streamStateUpdate':
+                    // The SFU pausing our subscribed track (congestion control / publisher pause)
+                    // stops video RTP entirely — the prime suspect for mid-stream dead windows.
+                    for (const s of msg.value.streamStates ?? [])
+                        dlog(`SS:LiveKit streamState ${s.trackSid}:`
+                            + ` ${s.state === StreamState.PAUSED ? 'PAUSED' : 'ACTIVE'} at ${ts()}`);
+                    break;
+                case 'update':
+                    // Participant updates carry per-track mute flags; a camera muting its video
+                    // track mid-session is another dead-window candidate.
+                    for (const p of msg.value.participants ?? []) {
+                        const tracks = (p.tracks ?? [])
+                            .map(t => `${t.sid}${t.muted ? ':muted' : ':live'}`)
+                            .join(' ');
+                        dlog(`SS:LiveKit participant ${p.identity} state=${p.state} tracks=[${tracks}] at ${ts()}`);
+                    }
+                    break;
                 default:
+                    if (msg.case && msg.case !== 'pong' && msg.case !== 'pongResp' && msg.case !== 'connectionQuality')
+                        dlog('SS:LiveKit signal:', msg.case, 'at', ts());
                     break;
             }
         }
@@ -620,7 +774,6 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
     ws.on('message', (data: WebSocket.RawData) => {
         signalQueue = signalQueue.then(() => handleSignal(data));
     });
-
     ws.on('close', () => dlog('SS:LiveKit ws closed.'));
 
     // Wait for the subscriber peer connection to connect and deliver at least a video track.
@@ -741,7 +894,23 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
         return micPublish;
     };
 
-    return { pc: pc!, videoTrack, audioTrack, close: cleanup, getKeyframe: () => keyframeCapturer.keyframe, ensureMicTrack, claimMic, writeMic };
+    return {
+        get videoCodec() { return videoTrack?.codec; },
+        get audioCodec() { return audioTrack?.codec; },
+        tokenExp: typeof joinClaims?.exp === 'number' ? joinClaims.exp : undefined,
+        isHealthy: () => !closed && pc?.connectionState !== 'failed' && pc?.connectionState !== 'closed',
+        onClosed: (cb: () => void) => {
+            if (closed)
+                cb();
+            else
+                closedCallbacks.push(cb);
+        },
+        close: cleanup,
+        getKeyframe: () => keyframeCapturer.keyframe,
+        ensureMicTrack,
+        claimMic,
+        writeMic,
+    };
 }
 
 /**
@@ -861,6 +1030,18 @@ export class LiveKitCameraStream {
     private viewerPromise?: Promise<LiveKitViewer>;
     private refcount = 0;
 
+    // Stable consumer-facing relays. Viewers (one per LiveKit session) push their received RTP
+    // into these via per-viewer sinks; the rebasers keep sequence numbers/timestamps continuous
+    // when the active session is swapped by a rollover, so consumers never renegotiate.
+    readonly videoRelay = new MediaStreamTrack({ kind: 'video' });
+    readonly audioRelay = new MediaStreamTrack({ kind: 'audio' });
+    private readonly videoRebaser = new RtpRebaser(90000);
+    private readonly audioRebaser = new RtpRebaser(48000);
+    private genCounter = 0;
+    private activeGen = 0;
+    private rolloverTimer?: NodeJS.Timeout;
+    private streamEndedCbs: (() => void)[] = [];
+
     constructor(
         private getDetails: () => Promise<LiveKitDetails>,
         private console: ConsoleLike,
@@ -873,9 +1054,108 @@ export class LiveKitCameraStream {
             this.console.log(...args);
     }
 
-    private viewerHealthy(viewer: LiveKitViewer): boolean {
-        const state = viewer.pc.connectionState;
-        return state !== 'failed' && state !== 'closed';
+    get videoCodec(): RTCRtpCodecParameters | undefined {
+        return this.viewer?.videoCodec;
+    }
+
+    get audioCodec(): RTCRtpCodecParameters | undefined {
+        return this.viewer?.audioCodec;
+    }
+
+    claimMic(token: object): boolean {
+        return this.viewer?.claimMic(token) ?? false;
+    }
+
+    writeMic(rtp: RtpPacket): void {
+        this.viewer?.writeMic(rtp);
+    }
+
+    async ensureMicTrack(): Promise<MediaStreamTrack> {
+        const viewer = await this.ensureViewer();
+        return viewer.ensureMicTrack();
+    }
+
+    /** Fired when the stream truly ends (active session died with no replacement). */
+    onStreamEnded(cb: () => void): void {
+        this.streamEndedCbs.push(cb);
+    }
+
+    private fireStreamEnded(): void {
+        for (const cb of this.streamEndedCbs.splice(0)) {
+            try { cb(); } catch { /* ignore */ }
+        }
+    }
+
+    /**
+     * Per-viewer RTP sinks. The video sink of a NEWER generation activates that generation on its
+     * first packet (the moment the pre-warmed replacement session delivers video); packets from
+     * older generations are dropped from then on. Audio strictly follows the active generation so
+     * the rebasers see clean source switches rather than interleaved sources.
+     */
+    private makeSinks(gen: number): ViewerSinks {
+        return {
+            video: rtp => {
+                if (gen < this.activeGen)
+                    return;
+                if (gen > this.activeGen) {
+                    this.activeGen = gen;
+                    this.dlog(`SS:LiveKit rollover: video source switched to session gen ${gen}`);
+                }
+                this.videoRelay.writeRtp(this.videoRebaser.rebase(gen, rtp));
+            },
+            audio: rtp => {
+                if (gen !== this.activeGen)
+                    return;
+                this.audioRelay.writeRtp(this.audioRebaser.rebase(gen, rtp));
+            },
+        };
+    }
+
+    /**
+     * SimpliSafe's LiveKit server enforces the join token's 10-minute expiry (media stops at exp,
+     * CONNECTION_TIMEOUT leave follows; signaling-level resume demands an ICE restart + DTLS
+     * continuation werift cannot do). So shortly before expiry, pre-warm a complete replacement
+     * session — a fresh live-view token joins as a distinct participant identity, so both sessions
+     * briefly coexist — and cut consumers over on its first video packet.
+     */
+    private scheduleRollover(viewer: LiveKitViewer): void {
+        if (this.rolloverTimer)
+            clearTimeout(this.rolloverTimer);
+        if (!viewer.tokenExp)
+            return;
+        const delay = viewer.tokenExp * 1000 - Date.now() - 45_000;
+        if (delay <= 0)
+            return;
+        this.rolloverTimer = setTimeout(() => {
+            this.rollover(viewer).catch(err =>
+                this.dlog('SS:LiveKit rollover failed; session rides to expiry and self-heals.', err));
+        }, delay);
+        this.dlog(`SS:LiveKit rollover scheduled in ${Math.round(delay / 1000)}s`);
+    }
+
+    private async rollover(oldViewer: LiveKitViewer): Promise<void> {
+        if (this.viewer !== oldViewer || this.refcount === 0)
+            return;
+        this.dlog('SS:LiveKit rollover: pre-warming replacement session before token expiry.');
+        const details = await this.getDetails();
+        const next = await startLiveKitViewer(details, this.console, this.debug, this.makeSinks(++this.genCounter));
+        if (this.viewer !== oldViewer || this.refcount === 0) {
+            next.close();
+            return;
+        }
+        this.viewer = next;
+        this.viewerPromise = Promise.resolve(next);
+        next.onClosed(() => {
+            if (this.viewer === next) {
+                this.viewer = undefined;
+                this.viewerPromise = undefined;
+                this.fireStreamEnded();
+            }
+        });
+        this.scheduleRollover(next);
+        // Let the replacement deliver its first video (which flips the active source), then drop
+        // the old session; closing it first would open a gap.
+        setTimeout(() => { try { oldViewer.close(); } catch { /* ignore */ } }, 2000);
     }
 
     /**
@@ -887,23 +1167,25 @@ export class LiveKitCameraStream {
     }
 
     private async ensureViewer(): Promise<LiveKitViewer> {
-        if (this.viewer && this.viewerHealthy(this.viewer))
+        if (this.viewer && this.viewer.isHealthy())
             return this.viewer;
 
         if (!this.viewerPromise) {
             this.viewerPromise = (async () => {
                 const details = await this.getDetails();
-                const viewer = await startLiveKitViewer(details, this.console, this.debug);
+                const viewer = await startLiveKitViewer(details, this.console, this.debug, this.makeSinks(++this.genCounter));
                 this.dlog('SS:LiveKit subscriber connected; bridging to Scrypted.',
-                    'video=', viewer.videoTrack?.codec?.mimeType ?? false,
-                    'audio=', viewer.audioTrack?.codec?.mimeType ?? false);
+                    'video=', viewer.videoCodec?.mimeType ?? false,
+                    'audio=', viewer.audioCodec?.mimeType ?? false);
                 this.viewer = viewer;
-                viewer.pc.connectionStateChange.subscribe(state => {
-                    if ((state === 'failed' || state === 'closed') && this.viewer === viewer) {
+                viewer.onClosed(() => {
+                    if (this.viewer === viewer) {
                         this.viewer = undefined;
                         this.viewerPromise = undefined;
+                        this.fireStreamEnded();
                     }
                 });
+                this.scheduleRollover(viewer);
                 return viewer;
             })();
             this.viewerPromise.catch(() => { this.viewerPromise = undefined; });
@@ -912,10 +1194,10 @@ export class LiveKitCameraStream {
     }
 
     async startSession(session: RTCSignalingSession): Promise<RTCSessionControl> {
-        const viewer = await this.ensureViewer();
+        await this.ensureViewer();
         this.refcount++;
         try {
-            return await bridgeToScryptedSession(session, viewer, this.console, () => this.release());
+            return await bridgeToScryptedSession(session, this, this.console, () => this.release());
         }
         catch (err) {
             this.release();
@@ -952,6 +1234,8 @@ export class LiveKitCameraStream {
     private release(): void {
         this.refcount = Math.max(0, this.refcount - 1);
         if (this.refcount === 0) {
+            if (this.rolloverTimer)
+                clearTimeout(this.rolloverTimer);
             this.viewer?.close();
             this.viewer = undefined;
             this.viewerPromise = undefined;
@@ -961,15 +1245,15 @@ export class LiveKitCameraStream {
 
 async function bridgeToScryptedSession(
     session: RTCSignalingSession,
-    viewer: LiveKitViewer,
+    stream: LiveKitCameraStream,
     console: ConsoleLike,
     onEnd: () => void,
 ): Promise<RTCSessionControl> {
 
     // Match the consumer peer connection's codecs to what LiveKit negotiated so RTP can be
     // forwarded without transcoding (payload types line up).
-    const videoCodec = viewer.videoTrack?.codec;
-    const audioCodec = viewer.audioTrack?.codec;
+    const videoCodec = stream.videoCodec;
+    const audioCodec = stream.audioCodec;
     const codecs: { video?: RTCRtpCodecParameters[]; audio?: RTCRtpCodecParameters[] } = {};
     if (videoCodec)
         codecs.video = [videoCodec];
@@ -981,20 +1265,20 @@ async function bridgeToScryptedSession(
         codecs,
     });
 
-    // Outbound video, fed by forwarding RTP from the LiveKit track.
+    // Outbound video, fed from the stream's stable relay (survives session rollovers).
     const videoOut = new MediaStreamTrack({ kind: 'video' });
     consumerPc.addTransceiver(videoOut, { direction: 'sendonly' });
-    viewer.videoTrack?.onReceiveRtp.subscribe(rtp => videoOut.writeRtp(rtp));
+    stream.videoRelay.onReceiveRtp.subscribe(rtp => videoOut.writeRtp(rtp));
 
     // Audio is bidirectional. We send the camera's audio to the consumer AND accept talk-back (the
     // viewer's microphone) on the same transceiver: Scrypted's WebRTC plugin implements HomeKit
     // two-way audio by pushing the mic audio back over THIS peer connection (it requests sendrecv),
     // not by calling the device's Intercom. Any inbound audio is forwarded up to the LiveKit
     // publisher so it reaches the camera.
-    if (viewer.audioTrack) {
+    if (audioCodec) {
         const audioOut = new MediaStreamTrack({ kind: 'audio' });
         consumerPc.addTransceiver(audioOut, { direction: 'sendrecv' });
-        viewer.audioTrack.onReceiveRtp.subscribe(rtp => audioOut.writeRtp(rtp));
+        stream.audioRelay.onReceiveRtp.subscribe(rtp => audioOut.writeRtp(rtp));
     }
     else {
         consumerPc.addTransceiver('audio', { direction: 'recvonly' });
@@ -1013,18 +1297,18 @@ async function bridgeToScryptedSession(
             return;
         track.onReceiveRtp.subscribe(rtp => {
             // Take (or keep) exclusive ownership of the shared mic; bail if another session is talking.
-            if (!viewer.claimMic(micToken))
+            if (!stream.claimMic(micToken))
                 return;
             if (!micStarting) {
                 micStarting = true;
-                viewer.ensureMicTrack()
+                stream.ensureMicTrack()
                     .then(() => { micStarted = true; })
                     .catch(err => console.warn('SS:LiveKit talk-back publish failed.', err));
             }
             if (!micStarted)
                 return;
             // Forward into the shared mic track with monotonic sequence/timestamp rewriting.
-            viewer.writeMic(rtp);
+            stream.writeMic(rtp);
         });
     });
 
@@ -1058,9 +1342,10 @@ async function bridgeToScryptedSession(
         if (state === 'failed' || state === 'closed')
             control.endSession().catch(() => { /* ignore */ });
     });
-    viewer.pc.connectionStateChange.subscribe(state => {
-        if (state === 'failed' || state === 'closed')
-            control.endSession().catch(() => { /* ignore */ });
+    // End the consumer session only when the stream truly ends (active session died with no
+    // replacement) — NOT on session rollovers, which consumers ride through via the relays.
+    stream.onStreamEnded(() => {
+        control.endSession().catch(() => { /* ignore */ });
     });
 
     return control;
