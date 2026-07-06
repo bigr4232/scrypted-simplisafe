@@ -322,6 +322,8 @@ interface LiveKitViewer {
      * published only once and reused across all consumer sessions.
      */
     ensureMicTrack: () => Promise<MediaStreamTrack>;
+    /** The published mic track, if ensureMicTrack has completed on this viewer. */
+    getMicTrack: () => MediaStreamTrack | undefined;
     /**
      * Request exclusive use of the shared talk-back track for the calling session (identified by a
      * stable token). Returns true if this session owns the mic and may write RTP; false if another
@@ -976,6 +978,7 @@ async function startLiveKitViewer(details: LiveKitDetails, console: ConsoleLike,
         close: cleanup,
         getKeyframe: () => keyframeCapturer.keyframe,
         ensureMicTrack,
+        getMicTrack: () => micTrackRef,
         claimMic,
         writeMic,
         isMicActive: () => !!micOwner,
@@ -1250,6 +1253,13 @@ export class LiveKitCameraStream {
             }
         });
         this.scheduleRollover(next);
+        // A device-level intercom may be mid-talk (rollover forced at the token drop-dead point);
+        // re-publish the shared mic on the replacement so the intercom's per-packet track lookup
+        // resumes flowing instead of writing into the old viewer's dead track.
+        if (this.micSinkHolds > 0) {
+            next.ensureMicTrack().catch(err =>
+                this.dlog('SS:LiveKit mic re-publish after rollover failed.', err));
+        }
         // Let the replacement deliver its first video (which flips the active source), then drop
         // the old session; closing it first would open a gap.
         setTimeout(() => { try { oldViewer.close(); } catch { /* ignore */ } }, 2000);
@@ -1314,10 +1324,11 @@ export class LiveKitCameraStream {
     /**
      * Acquire the shared talk-back sink for the device-level Intercom path (used by non-WebRTC
      * consumers). Ensures a connection exists (so talk-back works even if nothing is actively
-     * viewing) and holds a refcount for the duration. Returns the shared mic track to write RTP
-     * into, plus a release function that drops the refcount.
+     * viewing) and holds a refcount for the duration. Returns an accessor for the shared mic
+     * track — resolved per call, because a forced mid-talk rollover swaps the viewer and the
+     * track published at acquire time goes dead — plus a release function that drops the refcount.
      */
-    async acquireMicSink(): Promise<{ track: MediaStreamTrack; release: () => void }> {
+    async acquireMicSink(): Promise<{ getTrack: () => MediaStreamTrack | undefined; release: () => void }> {
         const viewer = await this.ensureViewer();
         this.refcount++;
         this.micSinkHolds++;
@@ -1330,8 +1341,8 @@ export class LiveKitCameraStream {
             this.release();
         };
         try {
-            const track = await viewer.ensureMicTrack();
-            return { track, release };
+            await viewer.ensureMicTrack();
+            return { getTrack: () => this.viewer?.getMicTrack(), release };
         }
         catch (err) {
             release();

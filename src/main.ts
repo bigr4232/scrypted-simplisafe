@@ -1544,9 +1544,14 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
 
             socket.on('message', buf => {
                 try {
+                    // Resolve the track per packet: after a forced mid-talk session rollover the
+                    // shared mic lives on the replacement viewer, not the one at acquire time.
+                    const track = sink.getTrack();
+                    if (!track)
+                        return;
                     const pkt = RtpPacket.deSerialize(buf);
-                    pkt.header.payloadType = sink.track.codec?.payloadType ?? 111;
-                    sink.track.writeRtp(pkt);
+                    pkt.header.payloadType = track.codec?.payloadType ?? 111;
+                    track.writeRtp(pkt);
                 }
                 catch {
                     /* ignore malformed packet */
@@ -1615,6 +1620,7 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
     private readonly uuidToNativeId = new Map<string, string>();
     private readonly identifierToNativeIds = new Map<string, Set<string>>();
     private readonly currentNativeIds = new Set<string>();
+    private readonly deviceCreations = new Map<string, Promise<SimplisafeCamera>>();
     private readonly readinessTasks = new Map<string, Promise<void>>();
     private readonly upgradedNativeIds = new Set<string>();
     private readonly readinessStorageKey = 'cameraReadiness';
@@ -2316,6 +2322,20 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
             return existing;
         }
 
+        // Scrypted can request the same device concurrently. createDevice awaits (initialize/sync)
+        // between the cache check and construction, so without memoization both callers would
+        // construct and the duplicate-instance guard would throw for the loser.
+        let creation = this.deviceCreations.get(normalized);
+        if (!creation) {
+            creation = this.createDevice(nativeId, normalized).finally(() => {
+                this.deviceCreations.delete(normalized);
+            });
+            this.deviceCreations.set(normalized, creation);
+        }
+        return creation;
+    }
+
+    private async createDevice(nativeId: string, normalized: string): Promise<SimplisafeCamera> {
         let lookupNativeId = normalized;
 
         if (!this.cameraDetails.has(lookupNativeId)) {
@@ -2341,6 +2361,14 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
                     this.console.warn(`SimpliSafe camera ${lookupNativeId} could not be refreshed during device retrieval. Falling back to cached details.`, err);
                 }
             }
+        }
+
+        // A concurrent caller may have created this device under an alias while we awaited (the
+        // memoization above only dedupes identical requested ids, and legacy ids redirect here).
+        // Everything from this check to construction is synchronous, so this closes the race.
+        const concurrentlyCreated = this.devices.get(lookupNativeId);
+        if (concurrentlyCreated) {
+            return concurrentlyCreated;
         }
 
         let details = this.cameraDetails.get(lookupNativeId);
