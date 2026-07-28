@@ -2206,7 +2206,9 @@ class SimplisafePlugin extends ScryptedDeviceBase implements DeviceProvider, Set
         this.persistCameraReadiness();
         device.markReady();
         await this.refreshDeviceDescriptor(normalized);
-        console.log('SS: camera now ready, advertising VideoCamera:', normalized);
+        // VideoCamera is advertised unconditionally for legacy cameras now, so this probe only
+        // gates the Online state, not the interface list.
+        this.console.log(`SimpliSafe readiness: ${normalized} passed the streaming probe.`);
     }
 
     private async initialize(): Promise<void> {
