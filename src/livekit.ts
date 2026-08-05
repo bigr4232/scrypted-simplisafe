@@ -1118,7 +1118,7 @@ export class LiveKitCameraStream {
     private micSinkHolds = 0;
 
     constructor(
-        private getDetails: () => Promise<LiveKitDetails>,
+        private getDetails: (force?: boolean) => Promise<LiveKitDetails>,
         private console: ConsoleLike,
         private debug: () => boolean,
     ) {
@@ -1273,7 +1273,12 @@ export class LiveKitCameraStream {
         return this.viewer?.getKeyframe();
     }
 
-    private async ensureViewer(): Promise<LiveKitViewer> {
+    /**
+     * @param force ask the details supplier to bypass any active API backoff. Set for viewer
+     * creation driven by a consumer actually asking for video, so a user pressing play retries now;
+     * the scheduled rollover leaves it unset and respects the backoff.
+     */
+    private async ensureViewer(force = false): Promise<LiveKitViewer> {
         if (this.viewer && this.viewer.isHealthy())
             return this.viewer;
 
@@ -1288,7 +1293,7 @@ export class LiveKitCameraStream {
 
         if (!this.viewerPromise) {
             this.viewerPromise = (async () => {
-                const details = await this.getDetails();
+                const details = await this.getDetails(force);
                 const viewer = await startLiveKitViewer(details, this.console, this.debug, this.makeSinks(++this.genCounter));
                 this.dlog('SS:LiveKit subscriber connected; bridging to Scrypted.',
                     'video=', viewer.videoCodec?.mimeType ?? false,
@@ -1310,7 +1315,7 @@ export class LiveKitCameraStream {
     }
 
     async startSession(session: RTCSignalingSession): Promise<RTCSessionControl> {
-        await this.ensureViewer();
+        await this.ensureViewer(true);
         this.refcount++;
         try {
             return await bridgeToScryptedSession(session, this, this.console, () => this.release());

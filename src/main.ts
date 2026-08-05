@@ -41,6 +41,7 @@ import crypto from 'crypto';
 import dgram from 'dgram';
 import jpegExtract from 'jpeg-extract';
 import WebSocket, { RawData } from 'ws';
+import packageJson from '../package.json';
 
 const { deviceManager, mediaManager, systemManager } = sdk;
 
@@ -59,7 +60,17 @@ const SS_OAUTH_DEVICE_UUID = '0000007E-0000-1000-8000-0026BB765291';
 const subscriptionCacheTime = 3000;
 const cameraCacheTime = 15000;
 const rateLimitInitialInterval = 60_000;
-const rateLimitMaxInterval = 2 * 60 * 60 * 1000;
+// Keep the ceiling low. A blocked window suppresses every request to that host, so an overlong
+// cap turns a brief upstream fault into an outage that outlives it — the camera would stay dark
+// for hours after SimpliSafe recovered.
+const rateLimitMaxInterval = 5 * 60 * 1000;
+// SimpliSafe fronts app-hub.prd.aser.simplisafe.com with a Kong gateway that 403s requests whose
+// User-Agent starts with a lowercase SDK token — `axios/1.10.0` and `okhttp/4.9.0` are both
+// rejected, while `Axios/1.10.0`, `curl/8.4.0` and an absent UA all pass. Axios sets its own UA by
+// default, so without this every getLiveView() call is refused and WebRTC streaming is dead while
+// the rest of the plugin (api.simplisafe.com, which does not filter) keeps working. Do not remove;
+// if this string ever needs to change, re-test it against /live-view first.
+const SS_USER_AGENT = `scrypted-simplisafe/${packageJson.version}`;
 // Media requests carry the SimpliSafe bearer token, so they must go to the hostname with TLS
 // verification enabled — never to a resolved IP with verification disabled (MITM could steal the
 // token, which grants full account access including the alarm).
@@ -74,6 +85,7 @@ const RESOLUTION_INTERFACE: ScryptedInterface | string = (ScryptedInterface as a
 
 const ssOAuth: AxiosInstance = axios.create({
     baseURL: 'https://auth.simplisafe.com/oauth',
+    headers: { 'User-Agent': SS_USER_AGENT },
 });
 axiosRetry(ssOAuth, { retries: 3 });
 
@@ -436,9 +448,11 @@ class SimplisafeApi extends EventEmitter {
     private subId?: string;
     private lastSubscription?: { id: string; data: any; timestamp: number };
     private cameraCache?: { data: SimplisafeCameraDetails[]; timestamp: number };
-    private isBlocked = false;
-    private nextAttempt = 0;
-    private nextBlockInterval = rateLimitInitialInterval;
+    // Backoff is tracked per host. api.simplisafe.com and app-hub.prd.aser.simplisafe.com are
+    // separate services; letting a failure on one suppress requests to the other is what turned a
+    // single refused endpoint into an outage of the whole integration.
+    private backoff = new Map<string, { nextAttempt: number; interval: number }>();
+    private liveViewRequests = new Map<string, Promise<LiveViewResponse>>();
     private socket?: WebSocket;
     private socketHeartbeat?: NodeJS.Timeout;
     private socketReconnect?: NodeJS.Timeout;
@@ -454,6 +468,7 @@ class SimplisafeApi extends EventEmitter {
         this.debug = debug;
         this.axios = axios.create({
             baseURL: 'https://api.simplisafe.com/v1',
+            headers: { 'User-Agent': SS_USER_AGENT },
         });
         axiosRetry(this.axios, { retries: 2 });
 
@@ -779,29 +794,46 @@ class SimplisafeApi extends EventEmitter {
      * { liveKitDetails: { liveKitURL, userToken }, cameraStatus }. Uses the app-hub host rather
      * than the standard api.simplisafe.com/v1 base (an absolute url overrides the axios baseURL).
      */
-    async getLiveView(cameraUuid: string): Promise<LiveViewResponse> {
-        // Ensure the subscription/location id is resolved; getSubscription populates this.subId.
-        await this.getSubscription();
-        const locationId = this.subId;
-        if (!locationId) {
-            throw new Error('Unable to determine SimpliSafe location id for live view.');
+    async getLiveView(cameraUuid: string, force = false): Promise<LiveViewResponse> {
+        // Consumers restart aggressively on failure (the rebroadcast prebuffer retries every 5s), so
+        // collapse overlapping requests for the same camera into one upstream call. Mirrors the
+        // viewerPromise memoization in LiveKitCameraStream.ensureViewer.
+        const inflight = this.liveViewRequests.get(cameraUuid);
+        if (inflight)
+            return inflight;
+
+        const request = (async () => {
+            // Ensure the subscription/location id is resolved; getSubscription populates this.subId.
+            await this.getSubscription();
+            const locationId = this.subId;
+            if (!locationId) {
+                throw new Error('Unable to determine SimpliSafe location id for live view.');
+            }
+
+            const raw = await this.request<any>({
+                method: 'GET',
+                url: `https://app-hub.prd.aser.simplisafe.com/v2/cameras/${cameraUuid}/${locationId}/live-view`,
+            }, { force });
+
+            // Tolerate a wrapped envelope (e.g. { data: {...} }). The token is short-lived.
+            const body: LiveViewResponse = raw?.liveKitDetails ? raw
+                : raw?.data?.liveKitDetails ? raw.data
+                : raw;
+
+            if (this.debug) {
+                this.log.log(`SS:liveView ${cameraUuid} liveKitURL=${body?.liveKitDetails?.liveKitURL} cameraStatus=${body?.cameraStatus}`);
+            }
+
+            return body;
+        })();
+
+        this.liveViewRequests.set(cameraUuid, request);
+        try {
+            return await request;
         }
-
-        const raw = await this.request<any>({
-            method: 'GET',
-            url: `https://app-hub.prd.aser.simplisafe.com/v2/cameras/${cameraUuid}/${locationId}/live-view`,
-        });
-
-        // Tolerate a wrapped envelope (e.g. { data: {...} }). The token is short-lived.
-        const body: LiveViewResponse = raw?.liveKitDetails ? raw
-            : raw?.data?.liveKitDetails ? raw.data
-            : raw;
-
-        if (this.debug) {
-            this.log.log(`SS:liveView ${cameraUuid} liveKitURL=${body?.liveKitDetails?.liveKitURL} cameraStatus=${body?.cameraStatus}`);
+        finally {
+            this.liveViewRequests.delete(cameraUuid);
         }
-
-        return body;
     }
 
     async getCameras(forceRefresh = false): Promise<SimplisafeCameraDetails[]> {
@@ -843,50 +875,138 @@ class SimplisafeApi extends EventEmitter {
         }
     }
 
-    private async request<T>(config: AxiosRequestConfig): Promise<T> {
-        if (this.isBlocked && Date.now() < this.nextAttempt) {
-            throw new RateLimitError('Blocking request: rate limited');
+    /**
+     * Host the backoff for this request is keyed on. A relative url resolves against the axios
+     * baseURL; getLiveView passes an absolute app-hub url.
+     */
+    private backoffKey(config: AxiosRequestConfig): string {
+        const url = config.url ?? '';
+        if (!/^https?:\/\//i.test(url))
+            return 'api.simplisafe.com';
+        try {
+            return new URL(url).host;
+        }
+        catch {
+            return 'api.simplisafe.com';
+        }
+    }
+
+    /**
+     * Log why a request failed. The response body carries the actual reason (and Kong's request_id,
+     * which SimpliSafe support can correlate); discarding it is what made a hard 403 look like rate
+     * limiting for weeks. Logged at warn/error so it is visible without the debug setting.
+     */
+    private logRequestFailure(config: AxiosRequestConfig, axiosError: AxiosError): void {
+        const method = (config.method ?? 'GET').toUpperCase();
+        const url = config.url ?? '';
+        const response = axiosError.response;
+        if (!response) {
+            this.log.warn(`SimpliSafe ${method} ${url} failed with no response.`, axiosError.message);
+            return;
         }
 
-        const accessToken = await this.getAccessToken();
-
+        const requestId = (response.data as any)?.request_id
+            ?? (response.headers as any)?.['x-kong-request-id'];
+        let body: string;
         try {
-            const response = await this.axios.request<T>({
+            body = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
+        }
+        catch {
+            body = '<unserializable>';
+        }
+        this.log.error(`SimpliSafe ${method} ${url} -> ${response.status} ${response.statusText}.`
+            + (requestId ? ` request_id=${requestId}.` : '')
+            + ` body=${(body ?? '').slice(0, 300)}`);
+    }
+
+    /**
+     * @param options.force ignore an active backoff window for one attempt. Used by user-initiated
+     * actions so pressing play retries immediately instead of failing until a timer happens to expire.
+     */
+    private async request<T>(config: AxiosRequestConfig, options?: { force?: boolean }): Promise<T> {
+        const key = this.backoffKey(config);
+        const backoff = this.backoff.get(key);
+        if (!options?.force && backoff && Date.now() < backoff.nextAttempt) {
+            const seconds = Math.ceil((backoff.nextAttempt - Date.now()) / 1000);
+            throw new RateLimitError(`Blocking request to ${key}: backing off for another ${seconds}s after a recent failure.`);
+        }
+
+        const send = async () => {
+            const accessToken = await this.getAccessToken();
+            return this.axios.request<T>({
                 ...config,
                 headers: {
                     ...config.headers,
                     Authorization: `${this.authManager.tokenType} ${accessToken}`,
                 },
             });
-            this.resetRateLimit();
+        };
+
+        try {
+            const response = await send();
+            this.resetRateLimit(key);
             return response.data;
-        } catch (error) {
+        }
+        catch (error) {
+            // Local failures (no access token, bad config) are not HTTP problems and must not be
+            // reported as rate limiting.
+            if (!axios.isAxiosError(error))
+                throw error;
+
             const axiosError = error as AxiosError;
+
+            // A 401 means the token went stale, not that the account is blocked. Refresh once and
+            // retry before giving up; on failure fall through to the 401 branch below.
+            if (axiosError.response?.status === 401) {
+                try {
+                    await this.authManager.refreshCredentials();
+                    const response = await send();
+                    this.resetRateLimit(key);
+                    return response.data;
+                }
+                catch {
+                    // fall through with the original 401
+                }
+            }
+
+            this.logRequestFailure(config, axiosError);
+
             if (!axiosError.response) {
-                this.setRateLimit();
+                this.setRateLimit(key);
                 throw new RateLimitError('SimpliSafe request failed: no response received.');
             }
 
-            if (axiosError.response.status === 403) {
-                this.setRateLimit();
-                throw new RateLimitError('SimpliSafe rejected the request (rate limited or auth failure).');
+            const status = axiosError.response.status;
+
+            // 429 is the only status that actually means rate limited.
+            if (status === 429) {
+                const retryAfter = Number((axiosError.response.headers as any)?.['retry-after']);
+                this.setRateLimit(key, Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : undefined);
+                throw new RateLimitError(`SimpliSafe rate limited requests to ${key}.`);
             }
+
+            if (status === 401)
+                throw new Error('SimpliSafe rejected the stored credentials. Re-authenticate in the plugin settings.');
+
+            // A 403 is a deterministic refusal, not congestion. Backing off would only delay an
+            // identical failure, and suppressing the host would take unrelated features down with
+            // it — see SS_USER_AGENT for the gateway filter that lands here.
+            if (status === 403)
+                throw new Error(`SimpliSafe refused the request to ${key} (403 Forbidden). See the logged response body for the reason.`);
 
             throw axiosError.response.data ?? axiosError;
         }
     }
 
-    private resetRateLimit(): void {
-        this.isBlocked = false;
-        this.nextBlockInterval = rateLimitInitialInterval;
+    private resetRateLimit(key: string): void {
+        this.backoff.delete(key);
     }
 
-    private setRateLimit(): void {
-        this.isBlocked = true;
-        this.nextAttempt = Date.now() + this.nextBlockInterval;
-        if (this.nextBlockInterval < rateLimitMaxInterval) {
-            this.nextBlockInterval *= 2;
-        }
+    private setRateLimit(key: string, retryAfterMs?: number): void {
+        const previous = this.backoff.get(key)?.interval ?? 0;
+        const interval = retryAfterMs
+            ?? Math.min(previous ? previous * 2 : rateLimitInitialInterval, rateLimitMaxInterval);
+        this.backoff.set(key, { nextAttempt: Date.now() + interval, interval });
     }
 
     private async getUserId(): Promise<string> {
@@ -1526,8 +1646,8 @@ class SimplisafeCamera extends ScryptedDeviceBase implements Camera, VideoCamera
     /** One shared LiveKit connection per camera, fanned out to all Scrypted consumers. */
     private getLiveKitStream(cameraUuid: string): LiveKitCameraStream {
         if (!this.liveKitStream) {
-            this.liveKitStream = new LiveKitCameraStream(async () => {
-                const liveView = await this.api.getLiveView(cameraUuid);
+            this.liveKitStream = new LiveKitCameraStream(async (force?: boolean) => {
+                const liveView = await this.api.getLiveView(cameraUuid, force);
                 const liveKit = liveView.liveKitDetails;
                 if (!liveKit?.liveKitURL || !liveKit?.userToken) {
                     throw new Error(`${this.getDisplayName()} live-view response did not include LiveKit details.`);
